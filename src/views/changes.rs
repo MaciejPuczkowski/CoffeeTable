@@ -1,0 +1,241 @@
+use crate::git::GitStatus;
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, StatefulWidget, Widget},
+};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+
+pub struct ChangesView {
+    pub root: PathBuf,
+    pub items: Vec<ChangesItem>,
+    pub list_state: ListState,
+    pub selected_path: Option<PathBuf>,
+}
+
+pub enum ChangesItem {
+    Header(String),
+    File { path: PathBuf, status: GitStatus },
+}
+
+impl ChangesView {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            items: Vec::new(),
+            list_state: ListState::default(),
+            selected_path: None,
+        }
+    }
+
+    pub fn set_status(&mut self, status: &HashMap<PathBuf, GitStatus>) {
+        let prev = self.selected_path.clone();
+        let mut staged: Vec<(PathBuf, GitStatus)> = Vec::new();
+        let mut modified: Vec<(PathBuf, GitStatus)> = Vec::new();
+        let mut untracked: Vec<(PathBuf, GitStatus)> = Vec::new();
+        for (p, s) in status {
+            match s {
+                GitStatus::Staged => staged.push((p.clone(), *s)),
+                GitStatus::Modified => modified.push((p.clone(), *s)),
+                GitStatus::Untracked => untracked.push((p.clone(), *s)),
+            }
+        }
+        staged.sort_by(|a, b| a.0.cmp(&b.0));
+        modified.sort_by(|a, b| a.0.cmp(&b.0));
+        untracked.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut items = Vec::new();
+        if !staged.is_empty() {
+            items.push(ChangesItem::Header(format!("Staged ({})", staged.len())));
+            for (p, s) in staged {
+                items.push(ChangesItem::File { path: p, status: s });
+            }
+        }
+        if !modified.is_empty() {
+            items.push(ChangesItem::Header(format!("Modified ({})", modified.len())));
+            for (p, s) in modified {
+                items.push(ChangesItem::File { path: p, status: s });
+            }
+        }
+        if !untracked.is_empty() {
+            items.push(ChangesItem::Header(format!("Untracked ({})", untracked.len())));
+            for (p, s) in untracked {
+                items.push(ChangesItem::File { path: p, status: s });
+            }
+        }
+        self.items = items;
+        self.restore_selection(prev);
+    }
+
+    fn restore_selection(&mut self, prev: Option<PathBuf>) {
+        if let Some(p) = prev {
+            if let Some(i) = self.items.iter().position(|it| match it {
+                ChangesItem::File { path, .. } => *path == p,
+                _ => false,
+            }) {
+                self.list_state.select(Some(i));
+                self.selected_path = Some(p);
+                return;
+            }
+        }
+        if let Some(i) = self.first_selectable() {
+            self.list_state.select(Some(i));
+            self.selected_path = match &self.items[i] {
+                ChangesItem::File { path, .. } => Some(path.clone()),
+                _ => None,
+            };
+        } else {
+            self.list_state.select(None);
+            self.selected_path = None;
+        }
+    }
+
+    fn first_selectable(&self) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|it| matches!(it, ChangesItem::File { .. }))
+    }
+
+    pub fn move_down(&mut self) {
+        let Some(curr) = self.list_state.selected() else {
+            if let Some(i) = self.first_selectable() {
+                self.list_state.select(Some(i));
+                self.sync_selected();
+            }
+            return;
+        };
+        for i in (curr + 1)..self.items.len() {
+            if matches!(self.items[i], ChangesItem::File { .. }) {
+                self.list_state.select(Some(i));
+                self.sync_selected();
+                return;
+            }
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        let Some(curr) = self.list_state.selected() else {
+            return;
+        };
+        for i in (0..curr).rev() {
+            if matches!(self.items[i], ChangesItem::File { .. }) {
+                self.list_state.select(Some(i));
+                self.sync_selected();
+                return;
+            }
+        }
+    }
+
+    pub fn jump_top(&mut self) {
+        if let Some(i) = self.first_selectable() {
+            self.list_state.select(Some(i));
+            self.sync_selected();
+        }
+    }
+
+    pub fn jump_bottom(&mut self) {
+        if let Some(i) = self
+            .items
+            .iter()
+            .rposition(|it| matches!(it, ChangesItem::File { .. }))
+        {
+            self.list_state.select(Some(i));
+            self.sync_selected();
+        }
+    }
+
+    fn sync_selected(&mut self) {
+        self.selected_path = self
+            .list_state
+            .selected()
+            .and_then(|i| self.items.get(i))
+            .and_then(|it| match it {
+                ChangesItem::File { path, .. } => Some(path.clone()),
+                _ => None,
+            });
+    }
+
+    pub fn selected_path(&self) -> Option<&Path> {
+        self.selected_path.as_deref()
+    }
+}
+
+pub struct ChangesWidget<'a> {
+    pub view: &'a mut ChangesView,
+    pub title: String,
+    pub focused: bool,
+}
+
+impl<'a> Widget for ChangesWidget<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let border_style = if self.focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let title = format!(" Changes — {} ", self.title);
+        let header_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD);
+        let root = self.view.root.clone();
+        let items: Vec<ListItem> = if self.view.items.is_empty() {
+            vec![ListItem::new(Line::from(Span::styled(
+                "  (no changes)",
+                Style::default().fg(Color::DarkGray),
+            )))]
+        } else {
+            self.view
+                .items
+                .iter()
+                .map(|it| match it {
+                    ChangesItem::Header(t) => ListItem::new(Line::from(Span::styled(
+                        format!("── {} ──", t),
+                        header_style,
+                    ))),
+                    ChangesItem::File { path, status } => {
+                        let rel = path
+                            .strip_prefix(&root)
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .to_string();
+                        let style = match status {
+                            GitStatus::Untracked => Style::default().fg(Color::Red),
+                            GitStatus::Modified => Style::default().fg(Color::Yellow),
+                            GitStatus::Staged => Style::default().fg(Color::Green),
+                        };
+                        let badge = match status {
+                            GitStatus::Untracked => "??",
+                            GitStatus::Modified => " M",
+                            GitStatus::Staged => "A ",
+                        };
+                        ListItem::new(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(badge.to_string(), style),
+                            Span::raw("  "),
+                            Span::styled(rel, style),
+                        ]))
+                    }
+                })
+                .collect()
+        };
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .title(title),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        StatefulWidget::render(list, area, buf, &mut self.view.list_state);
+    }
+}
