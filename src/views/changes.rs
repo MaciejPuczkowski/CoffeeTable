@@ -16,8 +16,15 @@ pub struct ChangesView {
     pub items: Vec<ChangesItem>,
     pub list_state: ListState,
     pub selected_path: Option<PathBuf>,
+    pub last_render_area: Option<ratatui::layout::Rect>,
 }
 
+pub enum ChangesAction {
+    None,
+    OpenFile(PathBuf),
+}
+
+#[derive(Clone)]
 pub enum ChangesItem {
     Header(String),
     File { path: PathBuf, status: GitStatus },
@@ -30,6 +37,39 @@ impl ChangesView {
             items: Vec::new(),
             list_state: ListState::default(),
             selected_path: None,
+            last_render_area: None,
+        }
+    }
+
+    pub fn mouse_select(&mut self, row: u16) -> ChangesAction {
+        let Some(area) = self.last_render_area else {
+            return ChangesAction::None;
+        };
+        if row <= area.y || row >= area.y + area.height.saturating_sub(1) {
+            return ChangesAction::None;
+        }
+        let local = (row - area.y - 1) as usize;
+        let idx = self.list_state.offset() + local;
+        if idx >= self.items.len() {
+            return ChangesAction::None;
+        }
+        if let ChangesItem::File { path, .. } = self.items[idx].clone() {
+            self.list_state.select(Some(idx));
+            self.selected_path = Some(path.clone());
+            ChangesAction::OpenFile(path)
+        } else {
+            ChangesAction::None
+        }
+    }
+
+    pub fn mouse_scroll(&mut self, delta: i32) {
+        let steps = delta.unsigned_abs() as usize;
+        for _ in 0..steps {
+            if delta > 0 {
+                self.move_down();
+            } else {
+                self.move_up();
+            }
         }
     }
 
@@ -173,6 +213,7 @@ pub struct ChangesWidget<'a> {
 
 impl<'a> Widget for ChangesWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        self.view.last_render_area = Some(area);
         let border_style = if self.focused {
             Style::default().fg(Color::Yellow)
         } else {

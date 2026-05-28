@@ -20,6 +20,7 @@ pub struct FileTreeView {
     list_state: ListState,
     selected_path: Option<PathBuf>,
     git_status: HashMap<PathBuf, GitStatus>,
+    pub last_render_area: Option<Rect>,
 }
 
 #[derive(Clone)]
@@ -48,6 +49,7 @@ impl FileTreeView {
             list_state: ListState::default(),
             selected_path: state.selected_path,
             git_status: HashMap::new(),
+            last_render_area: None,
         };
         view.expanded.insert(view.root.clone());
         view.rebuild_visible();
@@ -57,6 +59,46 @@ impl FileTreeView {
 
     pub fn set_git_status(&mut self, status: HashMap<PathBuf, GitStatus>) {
         self.git_status = status;
+    }
+
+    pub fn mouse_select(&mut self, row: u16) -> Action {
+        let Some(area) = self.last_render_area else {
+            return Action::None;
+        };
+        if row <= area.y || row >= area.y + area.height.saturating_sub(1) {
+            return Action::None;
+        }
+        let local = (row - area.y - 1) as usize;
+        let idx = self.list_state.offset() + local;
+        if idx >= self.visible.len() {
+            return Action::None;
+        }
+        let node = self.visible[idx].clone();
+        self.list_state.select(Some(idx));
+        self.selected_path = Some(node.path.clone());
+        if node.is_dir {
+            if self.expanded.contains(&node.path) {
+                self.expanded.remove(&node.path);
+            } else {
+                self.expanded.insert(node.path.clone());
+            }
+            self.rebuild_visible();
+            self.reselect(&node.path);
+            Action::None
+        } else {
+            Action::OpenFile(node.path)
+        }
+    }
+
+    pub fn mouse_scroll(&mut self, delta: i32) {
+        let steps = delta.unsigned_abs() as usize;
+        for _ in 0..steps {
+            if delta > 0 {
+                self.move_down();
+            } else {
+                self.move_up();
+            }
+        }
     }
 
     pub fn snapshot_state(&self) -> FileTreeState {
@@ -280,6 +322,7 @@ pub struct FileTreeWidget<'a> {
 
 impl<'a> Widget for FileTreeWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        self.view.last_render_area = Some(area);
         let items: Vec<ListItem> = self
             .view
             .visible

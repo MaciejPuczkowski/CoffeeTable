@@ -24,7 +24,7 @@ use std::{io, time::Duration};
 fn main() -> Result<()> {
     let paths = Paths::resolve()?;
     let db = Db::open(&paths.db_file)?;
-    let mut app = App::new(db)?;
+    let mut app = App::new(db, paths.settings_file)?;
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app);
@@ -60,10 +60,14 @@ fn run(
         terminal.draw(|f| ui::render(app, f))?;
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key)?;
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        app.on_key(key)?;
+                    }
                 }
+                Event::Mouse(m) => app.on_mouse(m)?,
+                _ => {}
             }
         }
 

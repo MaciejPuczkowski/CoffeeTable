@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS project_state (
 const KEY_FILE_TREE: &str = "file_tree";
 const KEY_OPEN_PROJECTS: &str = "open_projects";
 const KEY_ACTIVE_PROJECT: &str = "active_project";
-const KEY_ROOTS: &str = "roots";
 
 pub struct Db {
     conn: Connection,
@@ -153,34 +152,6 @@ impl Db {
                     .execute("DELETE FROM app_state WHERE key = ?1", params![KEY_ACTIVE_PROJECT])?;
             }
         }
-        Ok(())
-    }
-
-    pub fn load_roots_or_seed(&self, defaults: &[&str]) -> Result<Vec<PathBuf>> {
-        let raw: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT value FROM app_state WHERE key = ?1",
-                params![KEY_ROOTS],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(s) = raw {
-            let v: Vec<String> = serde_json::from_str(&s).unwrap_or_default();
-            return Ok(v.into_iter().map(PathBuf::from).collect());
-        }
-        let seeded: Vec<PathBuf> = defaults.iter().map(PathBuf::from).collect();
-        self.save_roots(&seeded)?;
-        Ok(seeded)
-    }
-
-    pub fn save_roots(&self, roots: &[PathBuf]) -> Result<()> {
-        let strs: Vec<String> = roots
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let json = serde_json::to_string(&strs)?;
-        self.set_app_state(KEY_ROOTS, &json)?;
         Ok(())
     }
 

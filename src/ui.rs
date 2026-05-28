@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Tabs},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 pub fn render(app: &mut App, frame: &mut Frame<'_>) {
@@ -190,27 +190,52 @@ fn bottom_centered(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, w, h)
 }
 
-fn render_tabs(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let titles: Vec<Line> = if app.open_projects.is_empty() {
-        vec![Line::from(Span::styled(
+fn render_tabs(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
+    app.tabs_area = area;
+    app.tab_rects.clear();
+    let block = Block::default().borders(Borders::ALL).title(" CoffeeTable ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.open_projects.is_empty() {
+        let para = Paragraph::new(Line::from(Span::styled(
             " (no open projects) ",
             Style::default().fg(Color::DarkGray),
-        ))]
-    } else {
-        app.open_projects
-            .iter()
-            .map(|p| Line::from(format!(" {} ", p.name)))
-            .collect()
-    };
-    let tabs = Tabs::new(titles)
-        .select(app.active_index.min(app.open_projects.len().saturating_sub(1)))
-        .block(Block::default().borders(Borders::ALL).title(" CoffeeTable "))
-        .highlight_style(
+        )));
+        frame.render_widget(para, inner);
+        return;
+    }
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = inner.x;
+    let max_x = inner.x + inner.width;
+    for (i, p) in app.open_projects.iter().enumerate() {
+        let label = format!(" {} ", p.name);
+        let label_w = label.chars().count() as u16;
+        if x + label_w > max_x {
+            break;
+        }
+        let style = if i == app.active_index {
             Style::default()
                 .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
-    frame.render_widget(tabs, area);
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        app.tab_rects
+            .push(Rect::new(x, inner.y, label_w, inner.height));
+        spans.push(Span::styled(label, style));
+        x += label_w;
+        if i + 1 < app.open_projects.len() && x + 3 <= max_x {
+            spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            x += 3;
+        }
+    }
+    let para = Paragraph::new(Line::from(spans));
+    frame.render_widget(para, inner);
 }
 
 fn render_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
@@ -225,6 +250,8 @@ fn render_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Min(20)])
         .split(area);
+    app.left_pane_area = chunks[0];
+    app.right_pane_area = chunks[1];
 
     let normal_mode = matches!(app.mode, AppMode::Normal);
     let Some(state) = app.project_views.get_mut(&project.id) else {

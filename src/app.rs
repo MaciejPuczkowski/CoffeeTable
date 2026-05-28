@@ -1,5 +1,5 @@
 use crate::{
-    config,
+    config::{self, Settings},
     db::Db,
     discovery, git,
     project::Project,
@@ -13,7 +13,8 @@ use crate::{
     },
 };
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -69,6 +70,7 @@ impl ProjectViewState {
 
 pub struct App {
     pub db: Db,
+    pub settings_path: PathBuf,
     pub roots: Vec<PathBuf>,
     pub open_projects: Vec<Project>,
     pub active_index: usize,
@@ -82,11 +84,16 @@ pub struct App {
     pub status: String,
     pub help_visible: bool,
     pub leader_pending: bool,
+    pub tabs_area: Rect,
+    pub tab_rects: Vec<Rect>,
+    pub left_pane_area: Rect,
+    pub right_pane_area: Rect,
 }
 
 impl App {
-    pub fn new(db: Db) -> Result<Self> {
-        let roots = db.load_roots_or_seed(config::DEFAULT_ROOTS)?;
+    pub fn new(db: Db, settings_path: PathBuf) -> Result<Self> {
+        let settings = Settings::load_or_seed(&settings_path)?;
+        let roots = settings.roots;
         let (open_ids, active_id) = db.load_open_projects()?;
         let all = db.list_projects()?;
         let open_projects: Vec<Project> = open_ids
@@ -130,6 +137,7 @@ impl App {
 
         Ok(Self {
             db,
+            settings_path,
             roots,
             open_projects,
             active_index,
@@ -143,6 +151,10 @@ impl App {
             status: String::new(),
             help_visible: false,
             leader_pending: false,
+            tabs_area: Rect::default(),
+            tab_rects: Vec::new(),
+            left_pane_area: Rect::default(),
+            right_pane_area: Rect::default(),
         })
     }
 
@@ -251,6 +263,13 @@ impl App {
         let _ = self.preview_selected();
     }
 
+    fn save_settings(&self) -> Result<()> {
+        let s = Settings {
+            roots: self.roots.clone(),
+        };
+        s.save(&self.settings_path)
+    }
+
     fn refresh_git_status(&mut self) -> Result<()> {
         let Some(project) = self.open_projects.get(self.active_index).cloned() else {
             return Ok(());
@@ -288,6 +307,148 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    pub fn on_mouse(&mut self, ev: MouseEvent) -> Result<()> {
+        if self.help_visible
+            || self.leader_pending
+            || !matches!(self.mode, AppMode::Normal)
+        {
+            return Ok(());
+        }
+        let col = ev.column;
+        let row = ev.row;
+        let in_tabs = contains(self.tabs_area, col, row);
+        let in_left = contains(self.left_pane_area, col, row);
+        let in_right = contains(self.right_pane_area, col, row);
+
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if in_tabs {
+                    if let Some(i) = self.tab_at(col, row) {
+                        self.active_index = i;
+                        let _ = self.persist_open_projects();
+                    }
+                } else if in_left {
+                    self.click_left_pane(col, row)?;
+                } else if in_right {
+                    self.click_right_pane(col, row);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if in_right {
+                    if let Some(s) = self.active_state() {
+                        if let Some(e) = s.editor.as_mut() {
+                            e.mouse_drag(col, row);
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if in_right {
+                    if let Some(s) = self.active_state() {
+                        if let Some(e) = s.editor.as_mut() {
+                            e.mouse_release();
+                            let status = std::mem::take(&mut e.status);
+                            if !status.is_empty() {
+                                self.status = status;
+                            }
+                        }
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => self.scroll_at(col, row, 3),
+            MouseEventKind::ScrollUp => self.scroll_at(col, row, -3),
+            MouseEventKind::ScrollRight => self.h_scroll_at(col, row, 3),
+            MouseEventKind::ScrollLeft => self.h_scroll_at(col, row, -3),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn tab_at(&self, col: u16, row: u16) -> Option<usize> {
+        for (i, r) in self.tab_rects.iter().enumerate() {
+            if contains(*r, col, row) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn click_left_pane(&mut self, col: u16, row: u16) -> Result<()> {
+        let pane = self
+            .active_state_ref()
+            .map(|s| s.left_pane)
+            .unwrap_or(LeftPaneMode::Tree);
+        let _ = col;
+        if let Some(s) = self.active_state() {
+            s.focus = Focus::Tree;
+        }
+        let action = if let Some(s) = self.active_state() {
+            match pane {
+                LeftPaneMode::Tree => match s.tree.mouse_select(row) {
+                    FileTreeAction::OpenFile(p) => Some(p),
+                    FileTreeAction::None => None,
+                },
+                LeftPaneMode::Changes => match s.changes.mouse_select(row) {
+                    crate::views::changes::ChangesAction::OpenFile(p) => Some(p),
+                    crate::views::changes::ChangesAction::None => None,
+                },
+            }
+        } else {
+            None
+        };
+        if let Some(path) = action {
+            self.open_file_in_editor(path)?;
+        } else {
+            self.preview_selected()?;
+        }
+        self.persist_active_tree()?;
+        Ok(())
+    }
+
+    fn click_right_pane(&mut self, col: u16, row: u16) {
+        if let Some(s) = self.active_state() {
+            if let Some(editor) = s.editor.as_mut() {
+                s.focus = Focus::Editor;
+                editor.mouse_press(col, row);
+            }
+        }
+    }
+
+    fn h_scroll_at(&mut self, col: u16, row: u16, delta: i32) {
+        if !contains(self.right_pane_area, col, row) {
+            return;
+        }
+        if let Some(s) = self.active_state() {
+            if let Some(e) = s.editor.as_mut() {
+                e.mouse_scroll_horizontal(delta);
+            }
+        }
+    }
+
+    fn scroll_at(&mut self, col: u16, row: u16, delta: i32) {
+        if contains(self.right_pane_area, col, row) {
+            if let Some(s) = self.active_state() {
+                if let Some(e) = s.editor.as_mut() {
+                    e.mouse_scroll(delta);
+                }
+            }
+            return;
+        }
+        if contains(self.left_pane_area, col, row) {
+            let pane = self
+                .active_state_ref()
+                .map(|s| s.left_pane)
+                .unwrap_or(LeftPaneMode::Tree);
+            if let Some(s) = self.active_state() {
+                match pane {
+                    LeftPaneMode::Tree => s.tree.mouse_scroll(delta),
+                    LeftPaneMode::Changes => s.changes.mouse_scroll(delta),
+                }
+            }
+            let _ = self.preview_selected();
+        }
     }
 
     fn is_help_key(&self, key: KeyEvent) -> bool {
@@ -691,7 +852,7 @@ impl App {
                     .and_then(|p| p.selected_root().cloned());
                 if let Some(root) = target {
                     self.roots.retain(|r| r != &root);
-                    self.db.save_roots(&self.roots)?;
+                    self.save_settings()?;
                     if let Some(p) = self.picker.as_mut() {
                         p.set_roots(self.roots.clone());
                     }
@@ -721,7 +882,7 @@ impl App {
             if let Some(path) = confirmed {
                 if !self.roots.contains(&path) {
                     self.roots.push(path);
-                    self.db.save_roots(&self.roots)?;
+                    self.save_settings()?;
                 }
                 if let Some(p) = self.picker.as_mut() {
                     p.set_roots(self.roots.clone());
@@ -990,6 +1151,15 @@ enum BrowseEnter {
     OpenSaved(Project),
     AddDiscovered { name: String, path: PathBuf },
     None,
+}
+
+fn contains(rect: Rect, col: u16, row: u16) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && col >= rect.x
+        && col < rect.x + rect.width
+        && row >= rect.y
+        && row < rect.y + rect.height
 }
 
 fn discover_new(roots: &[PathBuf], saved: &[Project]) -> Vec<(String, PathBuf)> {
