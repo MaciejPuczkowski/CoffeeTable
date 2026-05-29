@@ -22,6 +22,7 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(5),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -29,9 +30,20 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         .split(area);
 
     render_tabs(app, frame, chunks[0]);
-    render_body(app, frame, chunks[1]);
-    render_command_or_status(app, frame, chunks[2]);
-    render_footer(app, frame, chunks[3]);
+    render_view_tabs(app, frame, chunks[1]);
+    let view_mode = app
+        .open_projects
+        .get(app.active_index)
+        .and_then(|p| app.project_views.get(&p.id))
+        .map(|s| s.view_mode)
+        .unwrap_or(crate::app::ViewMode::Editor);
+    match view_mode {
+        crate::app::ViewMode::Terminal => render_terminal_body(app, frame, chunks[2]),
+        crate::app::ViewMode::Project => render_project_body(app, frame, chunks[2]),
+        crate::app::ViewMode::Editor => render_body(app, frame, chunks[2]),
+    }
+    render_command_or_status(app, frame, chunks[3]);
+    render_footer(app, frame, chunks[4]);
 
     match app.mode {
         AppMode::Picker => render_picker_overlay(app, frame, area),
@@ -43,6 +55,9 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     }
     if app.leader_pending {
         render_leader_overlay(frame, area);
+    }
+    if app.terminal_prefix {
+        render_terminal_leader_overlay(frame, area);
     }
     if app.help_visible {
         render_help_overlay(app, frame, area);
@@ -129,6 +144,46 @@ fn render_command_palette_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) 
     );
 }
 
+fn render_terminal_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
+    let entries: &[(&str, &str)] = &[
+        ("d", "Detach (back to Editor view)"),
+        ("n", "New terminal in this project"),
+        ("l", "Next terminal"),
+        ("h", "Previous terminal"),
+        ("x", "Close current terminal"),
+        ("Space", "Send literal Ctrl+Space to the shell"),
+        ("Esc", "Cancel prefix"),
+    ];
+    let popup_height = entries.len() as u16 + 4;
+    let popup = bottom_centered(60, popup_height, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Terminal <leader>  (Ctrl+Space) ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let mut lines: Vec<Line> = Vec::with_capacity(entries.len() + 2);
+    lines.push(Line::from(""));
+    for (key, desc) in entries {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{:<6}", key),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(desc.to_string()),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        "  Press the listed key, or any other to cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
     let entries: &[(&str, &str)] = &[
         ("p", "Projects (picker)"),
@@ -141,6 +196,9 @@ fn render_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
         ("h", "Show HEAD version (editor)"),
         ("d", "Show Diff vs HEAD (editor)"),
         ("C", "AI commit (generate message, review, commit)"),
+        ("t", "Terminal (focus existing or create first)"),
+        ("T", "New terminal (always create)"),
+        ("P", "Project view (meta + features)"),
         ("?", "Help"),
         ("q", "Quit"),
     ];
@@ -181,6 +239,928 @@ fn bottom_centered(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + area.height.saturating_sub(h + 2);
     Rect::new(x, y, w, h)
+}
+
+fn render_view_tabs(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
+    app.view_tabs_area = area;
+    app.view_tab_rects.clear();
+    let active_view = app
+        .open_projects
+        .get(app.active_index)
+        .and_then(|p| app.project_views.get(&p.id))
+        .map(|s| s.view_mode)
+        .unwrap_or(crate::app::ViewMode::Editor);
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = area.x + 1;
+    for (mode, label) in &[
+        (crate::app::ViewMode::Editor, "Editor"),
+        (crate::app::ViewMode::Terminal, "Terminal"),
+        (crate::app::ViewMode::Project, "Project"),
+    ] {
+        let text = format!(" {} ", label);
+        let w = text.chars().count() as u16;
+        let style = if active_view == *mode {
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        app.view_tab_rects
+            .push((*mode, Rect::new(x, area.y, w, 1)));
+        spans.push(Span::styled(text, style));
+        x += w;
+        spans.push(Span::raw("  "));
+        x += 2;
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_project_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
+    use crate::project::{CommentStatus, StepStatus};
+    use crate::views::project_view::{ProjectSection, ProjectSelection};
+    use ratatui::widgets::{List, ListItem, StatefulWidget};
+
+    let Some(project) = app.open_projects.get(app.active_index).cloned() else {
+        return;
+    };
+    let needs_load = app
+        .project_views
+        .get(&project.id)
+        .map(|s| s.project_view.is_none())
+        .unwrap_or(false);
+    if needs_load {
+        app.ensure_project_view_loaded();
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Min(20)])
+        .split(area);
+    app.left_pane_area = chunks[0];
+    app.right_pane_area = chunks[1];
+    app.project_list_inner = Block::default().borders(Borders::ALL).inner(chunks[0]);
+
+    let Some(state) = app.project_views.get_mut(&project.id) else {
+        return;
+    };
+    let focus = state.focus;
+    let Some(model) = state.project_view.as_mut() else {
+        let p = Paragraph::new("Project view unavailable (db error).")
+            .block(Block::default().borders(Borders::ALL).title(" Project "));
+        frame.render_widget(p, area);
+        return;
+    };
+
+    let in_form = model.feature_form.is_some();
+    let tree_focused = matches!(focus, Focus::Tree);
+    let editor_focused = matches!(focus, Focus::Editor);
+    let _ = in_form;
+
+    let sections = ProjectSection::all();
+    let mut items: Vec<ListItem> = Vec::with_capacity(model.rows());
+    for s in sections {
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            format!("  {}", s.label()),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )])));
+    }
+    items.push(ListItem::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "+ New Feature",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])));
+    let form_overlay = model.feature_form.as_ref().and_then(|f| {
+        f.feature_id.map(|id| (id, f.status, f.title.clone()))
+    });
+    for f in &model.features {
+        let (status, title) = match form_overlay {
+            Some((fid, st, ref t)) if fid == f.id => (st, t.clone()),
+            _ => (f.status, f.title.clone()),
+        };
+        let badge_color = feature_status_color(status);
+        let mut title_style = Style::default();
+        if status.is_closed() {
+            title_style = title_style
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::CROSSED_OUT);
+        }
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("[{}] ", status.label()),
+                Style::default().fg(badge_color),
+            ),
+            Span::styled(title, title_style),
+        ])));
+    }
+
+    let list_border = if tree_focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(list_border)
+                .title(format!(" {} ", project.name)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    StatefulWidget::render(list, chunks[0], frame.buffer_mut(), &mut model.list_state);
+
+    if model.feature_form.is_some() {
+        let rects = render_feature_form(model, chunks[1], frame, editor_focused);
+        app.feature_form_tab_rects = rects.tabs;
+        app.feature_form_field_rects = rects.fields;
+        app.feature_form_status_rects = rects.statuses;
+        return;
+    }
+    app.feature_form_tab_rects.clear();
+    app.feature_form_field_rects.clear();
+    app.feature_form_status_rects.clear();
+
+    if let Some(editor) = model.editor.as_mut() {
+        editor.focused = editor_focused;
+        let widget = crate::views::editor::EditorWidget {
+            view: editor,
+            area_title: "edit (Ctrl+S save, Esc/Backspace save+close)".into(),
+            git_status: None,
+        };
+        frame.render_widget(widget, chunks[1]);
+        return;
+    }
+
+    let detail_border = if editor_focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(detail_border);
+    let inner = detail_block.inner(chunks[1]);
+    frame.render_widget(detail_block, chunks[1]);
+
+    let mut lines: Vec<Line> = Vec::new();
+    match model.selection {
+        ProjectSelection::NewFeature => {
+            lines.push(Line::from(Span::styled(
+                "  + New Feature",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Press i/Enter to open the new-feature form.",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  First line = title. Lines below = description.",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Ctrl+S saves.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        ProjectSelection::Meta(section) => {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", section.label()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            let body = match section {
+                ProjectSection::About => model.meta.description.clone(),
+                ProjectSection::Conventions => model.meta.conventions.clone(),
+                ProjectSection::AiHints => model.meta.ai_hints.clone(),
+                ProjectSection::AiNotes => model.meta.ai_notes.clone(),
+            };
+            if body.trim().is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  (empty — press i/Enter to edit)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                for l in body.lines() {
+                    lines.push(Line::from(format!("  {}", l)));
+                }
+            }
+        }
+        ProjectSelection::Feature(i) => {
+            if let Some(feature) = model.features.get(i) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", feature.title),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("[{}]", feature.status.label()),
+                        Style::default().fg(feature_status_color(feature.status)),
+                    ),
+                ]));
+                lines.push(Line::from(""));
+                if feature.description.trim().is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  (no description — press i/Enter to open form)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    for l in feature.description.lines() {
+                        lines.push(Line::from(format!("  {}", l)));
+                    }
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  Steps",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                if feature.steps.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "    (none yet)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    for step in &feature.steps {
+                        let style = match step.status {
+                            StepStatus::Done => Style::default().fg(Color::Green),
+                            StepStatus::InProgress => Style::default().fg(Color::Yellow),
+                            StepStatus::Todo => Style::default(),
+                        };
+                        lines.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(format!("{} ", step.status.glyph()), style),
+                            Span::raw(step.summary.clone()),
+                        ]));
+                    }
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  Comments",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                if feature.comments.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "    (none yet)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    for c in &feature.comments {
+                        let badge_style = match c.status {
+                            CommentStatus::Queued => Style::default().fg(Color::Yellow),
+                            CommentStatus::Sent => Style::default().fg(Color::Cyan),
+                            CommentStatus::Done => Style::default().fg(Color::Green),
+                        };
+                        lines.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(format!("[{}] ", c.status.label()), badge_style),
+                            Span::raw(c.message.clone()),
+                        ]));
+                    }
+                }
+            }
+        }
+    }
+    let hints = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  i/Enter/l open form • n new feature • x cycle status • D delete feature",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  ? for full help • Ctrl+J/K switch view",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    lines.extend(hints);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn feature_status_color(status: crate::project::FeatureStatus) -> Color {
+    use crate::project::FeatureStatus;
+    match status {
+        FeatureStatus::Idea => Color::Cyan,
+        FeatureStatus::Todo => Color::Yellow,
+        FeatureStatus::InProgress => Color::LightYellow,
+        FeatureStatus::InReview => Color::Magenta,
+        FeatureStatus::Done => Color::Green,
+        FeatureStatus::Cancelled => Color::DarkGray,
+    }
+}
+
+pub struct FeatureFormRects {
+    pub tabs: Vec<(crate::views::feature_form::FormPage, Rect)>,
+    pub fields: Vec<(crate::views::feature_form::FormFocus, Rect)>,
+    pub statuses: Vec<(crate::project::FeatureStatus, Rect)>,
+}
+
+fn render_feature_form(
+    model: &mut crate::views::project_view::ProjectViewModel,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    focused: bool,
+) -> FeatureFormRects {
+    use crate::views::feature_form::{FormFocus, FormPage};
+    let mut rects = FeatureFormRects {
+        tabs: Vec::new(),
+        fields: Vec::new(),
+        statuses: Vec::new(),
+    };
+    let Some(form) = model.feature_form.as_mut() else { return rects };
+
+    let outer_border = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let outer_title = if form.feature_id.is_some() {
+        " Feature ".to_string()
+    } else {
+        " New Feature ".to_string()
+    };
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(outer_border)
+        .title(outer_title);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(inner);
+    rects.tabs = render_form_tabs(form, chunks[0], frame);
+
+    match form.page {
+        FormPage::Details => {
+            let title_focused = matches!(form.focus, FormFocus::Title);
+            let status_focused = matches!(form.focus, FormFocus::Status);
+            let desc_focused = matches!(form.focus, FormFocus::Description);
+            let steps_focused = matches!(form.focus, FormFocus::Step(_) | FormFocus::NewStep);
+
+            let details = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Ratio(1, 2),
+                    Constraint::Ratio(1, 2),
+                ])
+                .split(chunks[1]);
+            render_form_title(form, details[0], frame, title_focused);
+            rects.fields.push((FormFocus::Title, details[0]));
+            rects.statuses = render_form_status(form, details[1], frame, status_focused);
+            rects.fields.push((FormFocus::Status, details[1]));
+            render_form_description(form, details[2], frame, desc_focused);
+            rects.fields.push((FormFocus::Description, details[2]));
+            let step_rects = render_form_steps(form, details[3], frame, steps_focused);
+            rects.fields.extend(step_rects);
+        }
+        FormPage::Comments => {
+            let comments_focused = matches!(
+                form.focus,
+                FormFocus::Comment(_) | FormFocus::NewComment
+            );
+            let comment_rects = render_form_comments(form, chunks[1], frame, comments_focused);
+            rects.fields.extend(comment_rects);
+        }
+    }
+    rects
+}
+
+fn render_form_tabs(
+    form: &crate::views::feature_form::FeatureForm,
+    area: Rect,
+    frame: &mut Frame<'_>,
+) -> Vec<(crate::views::feature_form::FormPage, Rect)> {
+    use crate::views::feature_form::FormPage;
+    let visible_comments = form.comments.iter().filter(|c| !c.deleted).count();
+    let pages: [(FormPage, String); 2] = [
+        (FormPage::Details, " 1·Details ".to_string()),
+        (
+            FormPage::Comments,
+            format!(" 2·Comments ({}) ", visible_comments),
+        ),
+    ];
+    let mut spans: Vec<Span> = Vec::new();
+    let mut rects: Vec<(FormPage, Rect)> = Vec::new();
+    let mut x = area.x;
+    let space = Span::raw(" ");
+    spans.push(space.clone());
+    x = x.saturating_add(1);
+    for (page, label) in pages {
+        let active = page == form.page;
+        let style = if active {
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let w = label.chars().count() as u16;
+        rects.push((page, Rect::new(x, area.y, w, 1)));
+        spans.push(Span::styled(label, style));
+        x = x.saturating_add(w);
+        spans.push(space.clone());
+        x = x.saturating_add(1);
+    }
+    spans.push(Span::styled(
+        " Tab to switch",
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    rects
+}
+
+fn render_form_title(
+    form: &crate::views::feature_form::FeatureForm,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    focused: bool,
+) {
+    let block = field_block("Title", focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let placeholder = "(type a title)";
+    let text = form.title.as_str();
+    if focused {
+        render_inline_input(frame, inner, text, form.cursor, placeholder);
+    } else if text.trim().is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                placeholder,
+                Style::default().fg(Color::DarkGray),
+            )),
+            inner,
+        );
+    } else {
+        frame.render_widget(Paragraph::new(Line::from(text.to_string())), inner);
+    }
+}
+
+fn render_form_status(
+    form: &crate::views::feature_form::FeatureForm,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    focused: bool,
+) -> Vec<(crate::project::FeatureStatus, Rect)> {
+    use crate::project::FeatureStatus;
+    let block = field_block("Status", focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut rects: Vec<(FeatureStatus, Rect)> = Vec::new();
+    let mut x = inner.x;
+    spans.push(Span::raw(" "));
+    x = x.saturating_add(1);
+    for (i, st) in FeatureStatus::all().iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+            x = x.saturating_add(1);
+        }
+        let is_current = *st == form.status;
+        let is_cursor = focused && *st == form.status_cursor;
+        let label = format!(" {} ", st.label());
+        let color = feature_status_color(*st);
+        let style = if is_cursor {
+            Style::default()
+                .bg(color)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let w = label.chars().count() as u16;
+        rects.push((*st, Rect::new(x, inner.y, w, 1)));
+        spans.push(Span::styled(label, style));
+        x = x.saturating_add(w);
+        if is_current && !is_cursor {
+            spans.push(Span::styled("◆", Style::default().fg(color)));
+            x = x.saturating_add(1);
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+    rects
+}
+
+fn render_form_description(
+    form: &mut crate::views::feature_form::FeatureForm,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    focused: bool,
+) {
+    if focused && form.description_editing() {
+        if let Some(editor) = form.editor.as_mut() {
+            editor.focused = true;
+            let widget = crate::views::editor::EditorWidget {
+                view: editor,
+                area_title: "Description (Esc/Backspace to commit)".into(),
+                git_status: None,
+            };
+            frame.render_widget(widget, area);
+            return;
+        }
+    }
+    let block = field_block("Description (i/Enter to edit)", focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if form.description.trim().is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "(empty — i/Enter to edit)",
+                Style::default().fg(Color::DarkGray),
+            )),
+            inner,
+        );
+    } else {
+        let lines: Vec<Line> = form
+            .description
+            .lines()
+            .map(|l| Line::from(l.to_string()))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+fn render_form_steps(
+    form: &crate::views::feature_form::FeatureForm,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    focused: bool,
+) -> Vec<(crate::views::feature_form::FormFocus, Rect)> {
+    use crate::project::StepStatus;
+    use crate::views::feature_form::FormFocus;
+    let block = field_block("Steps (Ctrl+T cycle • Ctrl+D delete)", focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let active_step = match form.focus {
+        FormFocus::Step(i) => Some(i),
+        _ => None,
+    };
+    let on_new = matches!(form.focus, FormFocus::NewStep);
+    let mut rects: Vec<(FormFocus, Rect)> = Vec::new();
+
+    let mut row: u16 = 0;
+    for (i, step) in form.steps.iter().enumerate() {
+        if step.deleted {
+            continue;
+        }
+        if row >= inner.height {
+            break;
+        }
+        let is_active = Some(i) == active_step;
+        let prefix = if is_active { "▶ " } else { "  " };
+        let glyph_style = match step.status {
+            StepStatus::Done => Style::default().fg(Color::Green),
+            StepStatus::InProgress => Style::default().fg(Color::Yellow),
+            StepStatus::Todo => Style::default(),
+        };
+        let line_area = Rect {
+            x: inner.x,
+            y: inner.y + row,
+            width: inner.width,
+            height: 1,
+        };
+        let head = format!("{}{} ", prefix, step.status.glyph());
+        let head_w = head.chars().count() as u16;
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(head, glyph_style)])),
+            line_area,
+        );
+        let text_area = Rect {
+            x: inner.x.saturating_add(head_w),
+            y: inner.y + row,
+            width: inner.width.saturating_sub(head_w),
+            height: 1,
+        };
+        if is_active {
+            render_inline_input(frame, text_area, &step.summary, form.cursor, "(step text)");
+        } else {
+            frame.render_widget(
+                Paragraph::new(Line::from(step.summary.clone())),
+                text_area,
+            );
+        }
+        rects.push((FormFocus::Step(i), line_area));
+        row += 1;
+    }
+    if row < inner.height {
+        let line_area = Rect {
+            x: inner.x,
+            y: inner.y + row,
+            width: inner.width,
+            height: 1,
+        };
+        let prefix = if on_new { "▶ + " } else { "  + " };
+        let head_w = prefix.chars().count() as u16;
+        let prefix_style = if on_new {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(prefix, prefix_style)])),
+            line_area,
+        );
+        let text_area = Rect {
+            x: inner.x.saturating_add(head_w),
+            y: inner.y + row,
+            width: inner.width.saturating_sub(head_w),
+            height: 1,
+        };
+        if on_new {
+            render_inline_input(
+                frame,
+                text_area,
+                &form.new_step_buf,
+                form.cursor,
+                "new step…",
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "new step",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                text_area,
+            );
+        }
+        rects.push((FormFocus::NewStep, line_area));
+    }
+    rects
+}
+
+fn render_form_comments(
+    form: &crate::views::feature_form::FeatureForm,
+    area: Rect,
+    frame: &mut Frame<'_>,
+    focused: bool,
+) -> Vec<(crate::views::feature_form::FormFocus, Rect)> {
+    use crate::project::CommentStatus;
+    use crate::views::feature_form::FormFocus;
+    let block = field_block("Comments (Ctrl+T cycle • Ctrl+D delete)", focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let active_comment = match form.focus {
+        FormFocus::Comment(i) => Some(i),
+        _ => None,
+    };
+    let on_new = matches!(form.focus, FormFocus::NewComment);
+    let mut rects: Vec<(FormFocus, Rect)> = Vec::new();
+
+    let mut row: u16 = 0;
+    for (i, comment) in form.comments.iter().enumerate() {
+        if comment.deleted {
+            continue;
+        }
+        if row >= inner.height {
+            break;
+        }
+        let is_active = Some(i) == active_comment;
+        let prefix = if is_active { "▶ " } else { "  " };
+        let badge_style = match comment.status {
+            CommentStatus::Queued => Style::default().fg(Color::Yellow),
+            CommentStatus::Sent => Style::default().fg(Color::Cyan),
+            CommentStatus::Done => Style::default().fg(Color::Green),
+        };
+        let head = format!("{}[{}] ", prefix, comment.status.label());
+        let head_w = head.chars().count() as u16;
+        let line_area = Rect {
+            x: inner.x,
+            y: inner.y + row,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(head, badge_style)])),
+            line_area,
+        );
+        let text_area = Rect {
+            x: inner.x.saturating_add(head_w),
+            y: inner.y + row,
+            width: inner.width.saturating_sub(head_w),
+            height: 1,
+        };
+        let first_line = comment.message.lines().next().unwrap_or("");
+        if is_active {
+            render_inline_input(frame, text_area, first_line, form.cursor, "(comment)");
+        } else {
+            let suffix = if comment.message.lines().count() > 1 {
+                "  …"
+            } else {
+                ""
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(format!("{}{}", first_line, suffix))),
+                text_area,
+            );
+        }
+        rects.push((FormFocus::Comment(i), line_area));
+        row += 1;
+    }
+    if row < inner.height {
+        let line_area = Rect {
+            x: inner.x,
+            y: inner.y + row,
+            width: inner.width,
+            height: 1,
+        };
+        let prefix = if on_new { "▶ + " } else { "  + " };
+        let head_w = prefix.chars().count() as u16;
+        let prefix_style = if on_new {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(prefix, prefix_style)])),
+            line_area,
+        );
+        let text_area = Rect {
+            x: inner.x.saturating_add(head_w),
+            y: inner.y + row,
+            width: inner.width.saturating_sub(head_w),
+            height: 1,
+        };
+        if on_new {
+            render_inline_input(
+                frame,
+                text_area,
+                &form.new_comment_buf,
+                form.cursor,
+                "new comment…",
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "new comment",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                text_area,
+            );
+        }
+        rects.push((FormFocus::NewComment, line_area));
+    }
+    rects
+}
+
+fn render_inline_input(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    text: &str,
+    cursor: usize,
+    placeholder: &str,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    let width = area.width as usize;
+    let scroll = if cursor + 1 > width {
+        cursor + 1 - width
+    } else {
+        0
+    };
+    let buf = frame.buffer_mut();
+    let show_placeholder = total == 0;
+    for col in 0..width {
+        let x = area.x + col as u16;
+        let abs = scroll + col;
+        let mut style = Style::default();
+        let ch = if show_placeholder && col < placeholder.chars().count() {
+            style = style.fg(Color::DarkGray);
+            placeholder.chars().nth(col).unwrap_or(' ')
+        } else if abs < total {
+            chars[abs]
+        } else {
+            ' '
+        };
+        if abs == cursor {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        buf[(x, area.y)].set_char(ch).set_style(style);
+    }
+}
+
+fn field_block(title: &str, focused: bool) -> Block<'_> {
+    let style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(style)
+        .title(format!(" {} ", title))
+}
+
+fn render_terminal_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(project) = app.open_projects.get(app.active_index).cloned() else {
+        return;
+    };
+    app.terminal_tab_rects.clear();
+    app.terminal_new_rect = None;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(area);
+    app.terminal_tabs_area = chunks[0];
+
+    let Some(state) = app.project_views.get_mut(&project.id) else {
+        return;
+    };
+    let total = state.terminals.len();
+    let active = state.active_terminal.unwrap_or(0);
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = chunks[0].x + 1;
+    for i in 0..total {
+        let text = format!(" {} ", i + 1);
+        let w = text.chars().count() as u16;
+        let style = if i == active {
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        app.terminal_tab_rects
+            .push(Rect::new(x, chunks[0].y, w, 1));
+        spans.push(Span::styled(text, style));
+        x += w;
+        spans.push(Span::raw(" "));
+        x += 1;
+    }
+    let plus = " + ".to_string();
+    let plus_w = plus.chars().count() as u16;
+    let plus_rect = Rect::new(x, chunks[0].y, plus_w, 1);
+    app.terminal_new_rect = Some(plus_rect);
+    spans.push(Span::styled(
+        plus,
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+
+    let body_area = chunks[1];
+    let header_text = if total == 0 {
+        format!(" Terminal — {} (no shell) ", project.name)
+    } else {
+        format!(" Terminal — {} ", project.name)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(header_text);
+    let inner = block.inner(body_area);
+    frame.render_widget(block, body_area);
+
+    if total == 0 || active >= total {
+        let para = Paragraph::new("No terminal — Ctrl+Space then n to create one")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(para, inner);
+        return;
+    }
+    if let Some(term) = state.terminals.get_mut(active) {
+        let widget = crate::views::terminal::TerminalWidget {
+            view: term,
+            focused: true,
+        };
+        frame.render_widget(widget, inner);
+    }
 }
 
 fn render_tabs(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
@@ -392,12 +1372,14 @@ fn push_dir_entries(
             return;
         }
         let indent = "  ".repeat(depth as usize + 1);
-        let (marker, marker_style) = if is_dir {
-            ("▸ ", Style::default().fg(Color::Cyan))
+        let (icon, icon_color) = if is_dir {
+            (crate::icons::folder(false), crate::icons::folder_color())
         } else {
-            ("  ", Style::default().fg(Color::DarkGray))
+            (
+                crate::icons::for_file(&name),
+                crate::icons::color_for_file(&name),
+            )
         };
-        let name_style = Style::default();
         let display = if is_dir {
             format!("{}/", name)
         } else {
@@ -405,8 +1387,11 @@ fn push_dir_entries(
         };
         out.push(Line::from(vec![
             Span::raw(indent),
-            Span::styled(marker.to_string(), marker_style),
-            Span::styled(display, name_style),
+            Span::styled(
+                format!("{}  ", icon),
+                Style::default().fg(icon_color),
+            ),
+            Span::raw(display),
         ]));
         if is_dir && depth + 1 < max_depth {
             push_dir_entries(&child_path, depth + 1, max_depth, out);
@@ -486,14 +1471,23 @@ fn render_command_or_status(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
 fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let text = match app.mode {
-        AppMode::Normal => match current_focus(app) {
-            Some(Focus::Editor) => {
-                ":palette  •  i insert  •  v visual  •  /search  •  Backspace tree  •  Space menu  •  ? help"
+        AppMode::Normal => match current_view_mode(app) {
+            Some(crate::app::ViewMode::Project) => {
+                "j/k Tab move • i/Enter edit field • x cycle status • d cycle step • D delete • Ctrl+S save • Esc back • ? help"
                     .to_string()
             }
-            _ => {
-                ":palette  •  Space menu  •  ? help  •  Tab switch  •  Space q quit".to_string()
+            Some(crate::app::ViewMode::Terminal) => {
+                "Ctrl+Space leader • Ctrl+L/H switch • Ctrl+Shift+C SIGINT • Ctrl+J/K view • ? help".to_string()
             }
+            _ => match current_focus(app) {
+                Some(Focus::Editor) => {
+                    ":palette  •  i insert  •  v visual  •  /search  •  Backspace tree  •  Space menu  •  ? help"
+                        .to_string()
+                }
+                _ => {
+                    ":palette  •  Space menu  •  ? help  •  Tab switch  •  Space q quit".to_string()
+                }
+            },
         },
         AppMode::Picker => "? help  •  Esc close".into(),
         AppMode::Grep => "Type to filter  •  Enter open  •  Esc cancel".into(),
@@ -518,6 +1512,11 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
 fn current_focus(app: &App) -> Option<Focus> {
     let id = app.open_projects.get(app.active_index)?.id;
     app.project_views.get(&id).map(|s| s.focus)
+}
+
+fn current_view_mode(app: &App) -> Option<crate::app::ViewMode> {
+    let id = app.open_projects.get(app.active_index)?.id;
+    app.project_views.get(&id).map(|s| s.view_mode)
 }
 
 fn current_editor<'a>(app: &'a App) -> Option<&'a crate::views::editor::EditorView> {
@@ -888,6 +1887,61 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
             ],
         ),
         AppMode::Normal => {
+            let in_terminal = app
+                .open_projects
+                .get(app.active_index)
+                .and_then(|p| app.project_views.get(&p.id))
+                .map(|s| matches!(s.view_mode, crate::app::ViewMode::Terminal))
+                .unwrap_or(false);
+            let in_project = app
+                .open_projects
+                .get(app.active_index)
+                .and_then(|p| app.project_views.get(&p.id))
+                .map(|s| matches!(s.view_mode, crate::app::ViewMode::Project))
+                .unwrap_or(false);
+            if in_project {
+                return (
+                    "Project",
+                    vec![
+                        ("j/k  ↓/↑", "navigate sections + features (list)"),
+                        ("g / G", "jump to top / bottom"),
+                        ("i / Enter / l", "open form for selected (Meta editor or Feature form)"),
+                        ("n", "add new feature (opens empty form)"),
+                        ("x", "cycle selected feature status (in list)"),
+                        ("D", "delete selected feature (in list)"),
+                        ("— in Feature form —", ""),
+                        ("Tab / Shift+Tab", "next / previous field"),
+                        ("j/k", "also navigate fields"),
+                        ("i / Enter / l", "edit focused field (or cycle Status)"),
+                        ("Enter (single-line field)", "commit & next"),
+                        ("Esc (in field normal)", "commit field"),
+                        ("x", "cycle feature status (Status field)"),
+                        ("d", "cycle step status (Step field)"),
+                        ("D", "delete focused step / comment"),
+                        ("Ctrl+S", "save form to db"),
+                        ("Esc / Backspace (nav)", "save & close form"),
+                        ("Ctrl+J / Ctrl+K", "switch view (Editor/Terminal/Project)"),
+                    ],
+                );
+            }
+            if in_terminal {
+                return (
+                    "Terminal",
+                    vec![
+                        ("(any key)", "forward to PTY"),
+                        ("Ctrl+J / Ctrl+K", "switch between Editor and Terminal views"),
+                        ("Ctrl+L / Ctrl+H", "next / previous terminal in this project"),
+                        ("Ctrl+Shift+C", "send SIGINT (interrupt) to the running process"),
+                        ("Ctrl+Space", "prefix (next key triggers a terminal action)"),
+                        ("Ctrl+Space d", "detach (back to Editor view)"),
+                        ("Ctrl+Space n", "new terminal in this project"),
+                        ("Ctrl+Space l / h", "next / previous terminal (same as Ctrl+L/H)"),
+                        ("Ctrl+Space x", "close current terminal"),
+                        ("Ctrl+Space Space", "send a literal Ctrl+Space to the shell"),
+                        ("click tabs", "switch terminal by clicking on the numbered tabs"),
+                    ],
+                );
+            }
             let focus = current_focus(app).unwrap_or(Focus::Tree);
             match focus {
                 Focus::Tree => (

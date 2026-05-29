@@ -19,6 +19,8 @@ arboard = "3"
 fuzzy-matcher = "0.3"
 ignore = "0.4"
 regex = "1"
+portable-pty = "0.8"
+vt100 = "0.15"
 
 [profile.release]
 lto = true

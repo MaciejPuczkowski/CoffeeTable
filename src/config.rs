@@ -32,6 +32,8 @@ pub struct Settings {
     pub search_excludes: Vec<String>,
     #[serde(default)]
     pub ai: AiConfig,
+    #[serde(default)]
+    pub shell: ShellConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +67,31 @@ fn default_ai_binary() -> String {
     "claude".into()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellConfig {
+    #[serde(default = "default_shell_command")]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            command: default_shell_command(),
+            args: Vec::new(),
+        }
+    }
+}
+
+fn default_shell_command() -> String {
+    if cfg!(target_os = "windows") {
+        "powershell".into()
+    } else {
+        "bash".into()
+    }
+}
+
 impl Settings {
     pub fn load_or_seed(path: &Path) -> Result<Self> {
         if path.exists() {
@@ -92,6 +119,7 @@ impl Settings {
             roots: default_roots(),
             search_excludes: default_search_excludes(),
             ai: AiConfig::default(),
+            shell: ShellConfig::default(),
         }
     }
 }

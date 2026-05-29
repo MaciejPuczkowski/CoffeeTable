@@ -79,6 +79,13 @@ pub enum LeftPaneMode {
     Changes,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Editor,
+    Terminal,
+    Project,
+}
+
 pub struct ProjectViewState {
     pub tree: FileTreeView,
     pub changes: ChangesView,
@@ -86,6 +93,10 @@ pub struct ProjectViewState {
     pub editor: Option<EditorView>,
     pub focus: Focus,
     pub preferred_git_view: GitView,
+    pub terminals: Vec<crate::views::terminal::TerminalView>,
+    pub active_terminal: Option<usize>,
+    pub view_mode: ViewMode,
+    pub project_view: Option<crate::views::project_view::ProjectViewModel>,
 }
 
 impl ProjectViewState {
@@ -108,6 +119,7 @@ pub struct App {
     pub roots: Vec<PathBuf>,
     pub search_excludes: Vec<String>,
     pub ai_config: crate::config::AiConfig,
+    pub shell_config: crate::config::ShellConfig,
     pub open_projects: Vec<Project>,
     pub active_index: usize,
     pub project_views: HashMap<i64, ProjectViewState>,
@@ -121,10 +133,20 @@ pub struct App {
     pub status: String,
     pub help_visible: bool,
     pub leader_pending: bool,
+    pub terminal_prefix: bool,
     pub tabs_area: Rect,
     pub tab_rects: Vec<Rect>,
+    pub view_tabs_area: Rect,
+    pub view_tab_rects: Vec<(ViewMode, Rect)>,
+    pub terminal_tabs_area: Rect,
+    pub terminal_tab_rects: Vec<Rect>,
+    pub terminal_new_rect: Option<Rect>,
     pub left_pane_area: Rect,
     pub right_pane_area: Rect,
+    pub project_list_inner: Rect,
+    pub feature_form_tab_rects: Vec<(crate::views::feature_form::FormPage, Rect)>,
+    pub feature_form_field_rects: Vec<(crate::views::feature_form::FormFocus, Rect)>,
+    pub feature_form_status_rects: Vec<(crate::project::FeatureStatus, Rect)>,
 }
 
 impl App {
@@ -133,6 +155,7 @@ impl App {
         let roots = settings.roots;
         let search_excludes = settings.search_excludes;
         let ai_config = settings.ai;
+        let shell_config = settings.shell;
         let (open_ids, active_id) = db.load_open_projects()?;
         let all = db.list_projects()?;
         let open_projects: Vec<Project> = open_ids
@@ -160,6 +183,10 @@ impl App {
                     editor: None,
                     focus: Focus::Tree,
                     preferred_git_view: GitView::Working,
+                    terminals: Vec::new(),
+                    active_terminal: None,
+                    view_mode: ViewMode::Editor,
+                    project_view: None,
                 },
             );
         }
@@ -181,6 +208,7 @@ impl App {
             roots,
             search_excludes,
             ai_config,
+            shell_config,
             open_projects,
             active_index,
             project_views,
@@ -194,10 +222,20 @@ impl App {
             status: String::new(),
             help_visible: false,
             leader_pending: false,
+            terminal_prefix: false,
             tabs_area: Rect::default(),
             tab_rects: Vec::new(),
+            view_tabs_area: Rect::default(),
+            view_tab_rects: Vec::new(),
+            terminal_tabs_area: Rect::default(),
+            terminal_tab_rects: Vec::new(),
+            terminal_new_rect: None,
             left_pane_area: Rect::default(),
             right_pane_area: Rect::default(),
+            project_list_inner: Rect::default(),
+            feature_form_tab_rects: Vec::new(),
+            feature_form_field_rects: Vec::new(),
+            feature_form_status_rects: Vec::new(),
         })
     }
 
@@ -229,9 +267,27 @@ impl App {
             self.help_visible = true;
             return Ok(());
         }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
             self.copy_current_context();
             return Ok(());
+        }
+        if matches!(self.mode, AppMode::Normal) {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('j') => {
+                        self.cycle_view_mode(true);
+                        return Ok(());
+                    }
+                    KeyCode::Char('k') => {
+                        self.cycle_view_mode(false);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
         }
         if key.code == KeyCode::Char(' ')
             && !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -266,6 +322,9 @@ impl App {
         let Some(state) = self.active_state_ref() else {
             return true;
         };
+        if matches!(state.view_mode, ViewMode::Terminal) {
+            return false;
+        }
         match state.focus {
             Focus::Tree => true,
             Focus::Editor => match state.editor.as_ref().map(|e| e.mode) {
@@ -546,6 +605,36 @@ impl App {
         let Some(state) = self.active_state_ref() else {
             return true;
         };
+        if matches!(state.view_mode, ViewMode::Terminal) {
+            return false;
+        }
+        if matches!(state.view_mode, ViewMode::Project) {
+            if let Some(model) = state.project_view.as_ref() {
+                if let Some(form) = model.feature_form.as_ref() {
+                    use crate::views::feature_form::FormFocus;
+                    if matches!(
+                        form.focus,
+                        FormFocus::Title
+                            | FormFocus::Step(_)
+                            | FormFocus::NewStep
+                            | FormFocus::Comment(_)
+                            | FormFocus::NewComment
+                    ) {
+                        return false;
+                    }
+                    if let Some(e) = form.editor.as_ref() {
+                        if matches!(e.mode, EditorMode::Insert | EditorMode::Search) {
+                            return false;
+                        }
+                    }
+                }
+                if let Some(e) = model.editor.as_ref() {
+                    if matches!(e.mode, EditorMode::Insert | EditorMode::Search) {
+                        return false;
+                    }
+                }
+            }
+        }
         match state.focus {
             Focus::Tree => true,
             Focus::Editor => match state.editor.as_ref().map(|e| e.mode) {
@@ -600,6 +689,9 @@ impl App {
             KeyCode::Char('w') => self.palette_show_working(),
             KeyCode::Char('h') => self.palette_show_head(),
             KeyCode::Char('d') => self.palette_show_diff(),
+            KeyCode::Char('t') => self.open_or_focus_terminal()?,
+            KeyCode::Char('T') => self.new_terminal()?,
+            KeyCode::Char('P') => self.open_project_view()?,
             KeyCode::Char('?') => self.help_visible = true,
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char(' ') => {}
@@ -633,6 +725,7 @@ impl App {
             roots: self.roots.clone(),
             search_excludes: self.search_excludes.clone(),
             ai: self.ai_config.clone(),
+            shell: self.shell_config.clone(),
         };
         s.save(&self.settings_path)
     }
@@ -696,15 +789,72 @@ impl App {
                         self.active_index = i;
                         let _ = self.persist_open_projects();
                     }
+                } else if contains(self.view_tabs_area, col, row) {
+                    for (mode, rect) in self.view_tab_rects.clone() {
+                        if contains(rect, col, row) {
+                            if let Some(state) = self.active_state() {
+                                state.view_mode = mode;
+                            }
+                            if matches!(mode, ViewMode::Terminal) {
+                                let need = self
+                                    .active_state_ref()
+                                    .map(|s| s.terminals.is_empty())
+                                    .unwrap_or(false);
+                                if need {
+                                    let _ = self.new_terminal();
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                } else if contains(self.terminal_tabs_area, col, row) {
+                    if let Some(new_rect) = self.terminal_new_rect {
+                        if contains(new_rect, col, row) {
+                            let _ = self.new_terminal();
+                            return Ok(());
+                        }
+                    }
+                    let hits: Vec<(usize, Rect)> = self
+                        .terminal_tab_rects
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| (i, *r))
+                        .collect();
+                    for (idx, rect) in hits {
+                        if contains(rect, col, row) {
+                            if let Some(state) = self.active_state() {
+                                state.active_terminal = Some(idx);
+                                state.view_mode = ViewMode::Terminal;
+                            }
+                            return Ok(());
+                        }
+                    }
                 } else if in_left {
-                    self.click_left_pane(col, row)?;
+                    if matches!(self.current_view_mode(), Some(ViewMode::Project)) {
+                        self.click_project_list(col, row);
+                    } else {
+                        self.click_left_pane(col, row)?;
+                    }
                 } else if in_right {
-                    self.click_right_pane(col, row);
+                    if matches!(self.current_view_mode(), Some(ViewMode::Project)) {
+                        self.click_project_right(col, row);
+                    } else {
+                        self.click_right_pane(col, row);
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if in_right {
-                    if let Some(s) = self.active_state() {
+                    if matches!(self.current_view_mode(), Some(ViewMode::Project)) {
+                        if let Some(model) = self
+                            .active_state()
+                            .and_then(|s| s.project_view.as_mut())
+                        {
+                            if let Some(e) = model.editor.as_mut() {
+                                e.mouse_drag(col, row);
+                            }
+                        }
+                    } else if let Some(s) = self.active_state() {
                         if let Some(e) = s.editor.as_mut() {
                             e.mouse_drag(col, row);
                         }
@@ -713,7 +863,22 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if in_right {
-                    if let Some(s) = self.active_state() {
+                    if matches!(self.current_view_mode(), Some(ViewMode::Project)) {
+                        let status = {
+                            let Some(model) = self
+                                .active_state()
+                                .and_then(|s| s.project_view.as_mut())
+                            else {
+                                return Ok(());
+                            };
+                            let Some(e) = model.editor.as_mut() else { return Ok(()) };
+                            e.mouse_release();
+                            std::mem::take(&mut e.status)
+                        };
+                        if !status.is_empty() {
+                            self.status = status;
+                        }
+                    } else if let Some(s) = self.active_state() {
                         if let Some(e) = s.editor.as_mut() {
                             e.mouse_release();
                             let status = std::mem::take(&mut e.status);
@@ -775,6 +940,9 @@ impl App {
     }
 
     fn click_right_pane(&mut self, col: u16, row: u16) {
+        if let Some(s) = self.active_state() {
+            s.focus = Focus::Editor;
+        }
         let pill_hit = self
             .active_state_ref()
             .and_then(|s| s.editor.as_ref())
@@ -791,9 +959,6 @@ impl App {
                 None
             });
         if let Some(idx) = pill_hit {
-            if let Some(s) = self.active_state() {
-                s.focus = Focus::Editor;
-            }
             match idx {
                 0 => self.palette_show_working(),
                 1 => self.palette_show_head(),
@@ -804,7 +969,6 @@ impl App {
         }
         if let Some(s) = self.active_state() {
             if let Some(editor) = s.editor.as_mut() {
-                s.focus = Focus::Editor;
                 editor.mouse_press(col, row);
             }
         }
@@ -822,6 +986,32 @@ impl App {
     }
 
     fn scroll_at(&mut self, col: u16, row: u16, delta: i32) {
+        let view_mode = self.current_view_mode();
+        if matches!(view_mode, Some(ViewMode::Project)) {
+            if contains(self.right_pane_area, col, row) {
+                if let Some(model) = self
+                    .active_state()
+                    .and_then(|s| s.project_view.as_mut())
+                {
+                    if let Some(e) = model.editor.as_mut() {
+                        e.mouse_scroll(delta);
+                        return;
+                    }
+                }
+            }
+            if contains(self.left_pane_area, col, row) {
+                if delta > 0 {
+                    for _ in 0..delta {
+                        self.project_move_down();
+                    }
+                } else {
+                    for _ in 0..(-delta) {
+                        self.project_move_up();
+                    }
+                }
+            }
+            return;
+        }
         if contains(self.right_pane_area, col, row) {
             if let Some(s) = self.active_state() {
                 if let Some(e) = s.editor.as_mut() {
@@ -845,6 +1035,89 @@ impl App {
         }
     }
 
+    fn current_view_mode(&self) -> Option<ViewMode> {
+        self.active_state_ref().map(|s| s.view_mode)
+    }
+
+    fn click_project_list(&mut self, _col: u16, row: u16) {
+        let inner = self.project_list_inner;
+        if !contains(inner, _col, row) {
+            return;
+        }
+        let target_idx = (row - inner.y) as usize;
+        let (current_sel, rows_total) = {
+            let Some(state) = self.active_state() else { return };
+            let Some(model) = state.project_view.as_mut() else { return };
+            (model.list_state.selected(), model.rows())
+        };
+        if target_idx >= rows_total {
+            return;
+        }
+        let was_selected = current_sel == Some(target_idx);
+        {
+            let Some(state) = self.active_state() else { return };
+            let Some(model) = state.project_view.as_mut() else { return };
+            model.list_state.select(Some(target_idx));
+            model.sync_selection_from_list();
+            state.focus = Focus::Tree;
+        }
+        if was_selected {
+            self.project_begin_edit();
+            if let Some(state) = self.active_state() {
+                if state.project_view.as_ref().and_then(|m| m.editor.as_ref()).is_some() {
+                    state.focus = Focus::Editor;
+                }
+            }
+        }
+    }
+
+    fn click_project_right(&mut self, col: u16, row: u16) {
+        if let Some(state) = self.active_state() {
+            state.focus = Focus::Editor;
+        }
+        let tab_hit = self
+            .feature_form_tab_rects
+            .iter()
+            .find(|(_, r)| contains(*r, col, row))
+            .map(|(p, _)| *p);
+        if let Some(page) = tab_hit {
+            use crate::views::feature_form::FormPage;
+            self.with_feature_form(|f| match page {
+                FormPage::Details => f.switch_to_details(),
+                FormPage::Comments => f.switch_to_comments(),
+            });
+            return;
+        }
+        let status_hit = self
+            .feature_form_status_rects
+            .iter()
+            .find(|(_, r)| contains(*r, col, row))
+            .map(|(s, _)| *s);
+        if let Some(status) = status_hit {
+            self.with_feature_form(|f| {
+                f.click_focus(crate::views::feature_form::FormFocus::Status);
+                f.set_status(status);
+            });
+            return;
+        }
+        let field_hit = self
+            .feature_form_field_rects
+            .iter()
+            .find(|(_, r)| contains(*r, col, row))
+            .map(|(f, _)| *f);
+        if let Some(target) = field_hit {
+            self.with_feature_form(|f| f.click_focus(target));
+            return;
+        }
+        if let Some(state) = self.active_state() {
+            if let Some(model) = state.project_view.as_mut() {
+                if let Some(editor) = model.editor.as_mut() {
+                    editor.mouse_press(col, row);
+                }
+            }
+        }
+    }
+
     fn is_help_key(&self, key: KeyEvent) -> bool {
         if key.code != KeyCode::Char('?') || key.modifiers.contains(KeyModifiers::CONTROL) {
             return false;
@@ -865,6 +1138,9 @@ impl App {
             | AppMode::AiCommit => false,
             AppMode::Normal => {
                 if let Some(state) = self.active_state_ref() {
+                    if matches!(state.view_mode, ViewMode::Terminal) {
+                        return false;
+                    }
                     if state.focus == Focus::Editor {
                         if let Some(e) = &state.editor {
                             if matches!(e.mode, EditorMode::Insert | EditorMode::Search) {
@@ -879,6 +1155,15 @@ impl App {
     }
 
     fn on_key_normal(&mut self, key: KeyEvent) -> Result<()> {
+        let mode = self
+            .active_state_ref()
+            .map(|s| s.view_mode)
+            .unwrap_or(ViewMode::Editor);
+        match mode {
+            ViewMode::Terminal => return self.on_key_terminal(key),
+            ViewMode::Project => return self.on_key_project_view(key),
+            ViewMode::Editor => {}
+        }
         if self.handle_global_normal(key)? {
             return Ok(());
         }
@@ -891,6 +1176,61 @@ impl App {
             Focus::Editor => self.on_key_editor(key)?,
         }
         Ok(())
+    }
+
+    fn cycle_view_mode(&mut self, forward: bool) {
+        let order = [ViewMode::Editor, ViewMode::Terminal, ViewMode::Project];
+        if let Some(state) = self.active_state() {
+            let cur = order.iter().position(|m| *m == state.view_mode).unwrap_or(0);
+            let next = if forward {
+                (cur + 1) % order.len()
+            } else {
+                (cur + order.len() - 1) % order.len()
+            };
+            state.view_mode = order[next];
+        }
+        self.after_view_mode_change();
+    }
+
+    fn after_view_mode_change(&mut self) {
+        let mode = self
+            .active_state_ref()
+            .map(|s| s.view_mode)
+            .unwrap_or(ViewMode::Editor);
+        match mode {
+            ViewMode::Terminal => {
+                let needs_spawn = self
+                    .active_state_ref()
+                    .map(|s| s.terminals.is_empty())
+                    .unwrap_or(false);
+                if needs_spawn {
+                    let _ = self.new_terminal();
+                }
+            }
+            ViewMode::Project => {
+                self.ensure_project_view_loaded();
+            }
+            ViewMode::Editor => {}
+        }
+    }
+
+    pub fn ensure_project_view_loaded(&mut self) {
+        let Some(project) = self.active_project().cloned() else {
+            return;
+        };
+        let already = self
+            .active_state_ref()
+            .map(|s| s.project_view.is_some())
+            .unwrap_or(false);
+        if already {
+            return;
+        }
+        let meta = self.db.load_project_meta(project.id).unwrap_or_default();
+        let features = self.db.list_features(project.id).unwrap_or_default();
+        let model = crate::views::project_view::ProjectViewModel::new(meta, features);
+        if let Some(state) = self.active_state() {
+            state.project_view = Some(model);
+        }
     }
 
     fn handle_global_normal(&mut self, key: KeyEvent) -> Result<bool> {
@@ -1758,6 +2098,10 @@ impl App {
                     editor: None,
                     focus: Focus::Tree,
                     preferred_git_view: GitView::Working,
+                    terminals: Vec::new(),
+                    active_terminal: None,
+                    view_mode: ViewMode::Editor,
+                    project_view: None,
                 },
             );
             self.open_projects.push(project);
@@ -1775,6 +2119,759 @@ impl App {
         self.picker = Some(ProjectPicker::new(saved, discovered, self.roots.clone()));
         self.mode = AppMode::Picker;
         Ok(())
+    }
+
+    fn open_project_view(&mut self) -> Result<()> {
+        if let Some(state) = self.active_state() {
+            state.view_mode = ViewMode::Project;
+        }
+        self.ensure_project_view_loaded();
+        Ok(())
+    }
+
+    fn open_or_focus_terminal(&mut self) -> Result<()> {
+        let already_has = self
+            .active_state_ref()
+            .map(|s| !s.terminals.is_empty())
+            .unwrap_or(false);
+        if !already_has {
+            self.new_terminal()?;
+        } else if let Some(state) = self.active_state() {
+            state.view_mode = ViewMode::Terminal;
+        }
+        Ok(())
+    }
+
+    fn new_terminal(&mut self) -> Result<()> {
+        let shell = self.shell_config.clone();
+        let Some(project_path) = self.active_project().map(|p| p.path.clone()) else {
+            self.status = "No active project".into();
+            return Ok(());
+        };
+        match crate::views::terminal::TerminalView::spawn(&shell, &project_path, 24, 80) {
+            Ok(term) => {
+                if let Some(state) = self.active_state() {
+                    state.terminals.push(term);
+                    state.active_terminal = Some(state.terminals.len() - 1);
+                    state.view_mode = ViewMode::Terminal;
+                }
+            }
+            Err(e) => {
+                self.status = format!("Failed to spawn terminal: {}", e);
+            }
+        }
+        Ok(())
+    }
+
+    fn close_active_terminal(&mut self) {
+        if let Some(state) = self.active_state() {
+            if let Some(i) = state.active_terminal {
+                if i < state.terminals.len() {
+                    state.terminals.remove(i);
+                }
+                if state.terminals.is_empty() {
+                    state.active_terminal = None;
+                    state.view_mode = ViewMode::Editor;
+                } else {
+                    state.active_terminal = Some(i.min(state.terminals.len() - 1));
+                }
+            }
+        }
+    }
+
+    fn cycle_terminal(&mut self, forward: bool) {
+        if let Some(state) = self.active_state() {
+            let n = state.terminals.len();
+            if n == 0 {
+                return;
+            }
+            let cur = state.active_terminal.unwrap_or(0);
+            let next = if forward {
+                (cur + 1) % n
+            } else {
+                (cur + n - 1) % n
+            };
+            state.active_terminal = Some(next);
+        }
+    }
+
+    fn on_key_terminal(&mut self, key: KeyEvent) -> Result<()> {
+        if self.terminal_prefix {
+            self.terminal_prefix = false;
+            match key.code {
+                KeyCode::Esc => return Ok(()),
+                KeyCode::Char('d') => {
+                    if let Some(state) = self.active_state() {
+                        state.view_mode = ViewMode::Editor;
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char('n') => return self.new_terminal(),
+                KeyCode::Char('l') => {
+                    self.cycle_terminal(true);
+                    return Ok(());
+                }
+                KeyCode::Char('h') => {
+                    self.cycle_terminal(false);
+                    return Ok(());
+                }
+                KeyCode::Char('x') => {
+                    self.close_active_terminal();
+                    return Ok(());
+                }
+                KeyCode::Char(' ') => {
+                    let bytes = vec![0];
+                    self.write_to_active_terminal(&bytes);
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            self.write_to_active_terminal(&[0x03]);
+            return Ok(());
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char(' ') => {
+                    self.terminal_prefix = true;
+                    return Ok(());
+                }
+                KeyCode::Char('l') => {
+                    self.cycle_terminal(true);
+                    return Ok(());
+                }
+                KeyCode::Char('h') => {
+                    self.cycle_terminal(false);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        if let Some(bytes) = crate::views::terminal::key_to_bytes(key) {
+            self.write_to_active_terminal(&bytes);
+        }
+        Ok(())
+    }
+
+    fn on_key_project_view(&mut self, key: KeyEvent) -> Result<()> {
+        let is_editing = self
+            .active_state_ref()
+            .and_then(|s| s.project_view.as_ref())
+            .map(|m| m.editor.is_some() || m.feature_form.is_some())
+            .unwrap_or(false);
+        if is_editing {
+            return self.on_key_project_editing(key);
+        }
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.project_move_down(),
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.project_move_up(),
+            (KeyCode::Char('g'), m) if !m.contains(KeyModifiers::CONTROL) => self.project_jump_top(),
+            (KeyCode::Char('G'), _) => self.project_jump_bottom(),
+            (KeyCode::Char('i'), _) | (KeyCode::Enter, _) | (KeyCode::Char('l'), _)
+            | (KeyCode::Right, _) => self.project_begin_edit(),
+            (KeyCode::Char('n'), _) => self.project_add_feature()?,
+            (KeyCode::Char('x'), _) => self.project_cycle_status()?,
+            (KeyCode::Char('D'), _) => self.project_delete_selected()?,
+            _ => {}
+        }
+        if let Some(state) = self.active_state() {
+            let in_edit = state
+                .project_view
+                .as_ref()
+                .map(|m| m.editor.is_some() || m.feature_form.is_some())
+                .unwrap_or(false);
+            state.focus = if in_edit { Focus::Editor } else { Focus::Tree };
+        }
+        Ok(())
+    }
+
+    fn on_key_project_editing(&mut self, key: KeyEvent) -> Result<()> {
+        let has_form = self
+            .active_state_ref()
+            .and_then(|s| s.project_view.as_ref())
+            .map(|m| m.feature_form.is_some())
+            .unwrap_or(false);
+        if has_form {
+            return self.on_key_feature_form(key);
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(key.code, KeyCode::Char('s')) {
+            self.project_save_edit()?;
+            return Ok(());
+        }
+        let close_after = {
+            let Some(state) = self.active_state() else { return Ok(()) };
+            let Some(model) = state.project_view.as_mut() else { return Ok(()) };
+            let Some(editor) = model.editor.as_mut() else { return Ok(()) };
+            let normal = editor.mode == EditorMode::Normal;
+            let close_keys = matches!(key.code, KeyCode::Esc | KeyCode::Backspace);
+            if normal && close_keys {
+                true
+            } else {
+                editor.handle_key(key);
+                editor.did_save = false;
+                editor.request_focus_tree = false;
+                false
+            }
+        };
+        let pending_status = self
+            .active_state()
+            .and_then(|s| s.project_view.as_mut())
+            .and_then(|m| m.editor.as_mut())
+            .map(|e| std::mem::take(&mut e.status))
+            .unwrap_or_default();
+        if !pending_status.is_empty() {
+            self.status = pending_status;
+        }
+        if close_after {
+            self.project_save_edit()?;
+        }
+        Ok(())
+    }
+
+    fn on_key_feature_form(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::views::feature_form::FormFocus;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if ctrl && matches!(key.code, KeyCode::Char('s')) {
+            self.project_save_edit()?;
+            return Ok(());
+        }
+        if alt && matches!(key.code, KeyCode::Char('1')) {
+            self.with_feature_form(|f| f.switch_to_details());
+            return Ok(());
+        }
+        if alt && matches!(key.code, KeyCode::Char('2')) {
+            self.with_feature_form(|f| f.switch_to_comments());
+            return Ok(());
+        }
+        if matches!(key.code, KeyCode::Tab) {
+            self.with_feature_form(|f| f.toggle_page());
+            return Ok(());
+        }
+        if matches!(key.code, KeyCode::BackTab) {
+            self.with_feature_form(|f| f.toggle_page());
+            return Ok(());
+        }
+        let desc_editing = self
+            .active_state_ref()
+            .and_then(|s| s.project_view.as_ref())
+            .and_then(|m| m.feature_form.as_ref())
+            .map(|f| f.description_editing())
+            .unwrap_or(false);
+        if desc_editing {
+            return self.on_key_feature_form_editor(key);
+        }
+        let focus = match self
+            .active_state_ref()
+            .and_then(|s| s.project_view.as_ref())
+            .and_then(|m| m.feature_form.as_ref())
+            .map(|f| f.focus)
+        {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        if matches!(key.code, KeyCode::Esc) {
+            self.project_close_form()?;
+            return Ok(());
+        }
+        match focus {
+            FormFocus::Status => self.handle_status_focus_key(key),
+            FormFocus::Description => self.handle_description_focus_key(key)?,
+            FormFocus::Title
+            | FormFocus::Step(_)
+            | FormFocus::NewStep
+            | FormFocus::Comment(_)
+            | FormFocus::NewComment => self.handle_text_focus_key(key, focus)?,
+        }
+        Ok(())
+    }
+
+    fn handle_status_focus_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                self.with_feature_form(|f| f.focus_next());
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                self.with_feature_form(|f| f.focus_prev());
+            }
+            (KeyCode::Left, _) | (KeyCode::Char('h'), _) => {
+                self.with_feature_form(|f| f.status_cursor_left());
+            }
+            (KeyCode::Right, _) | (KeyCode::Char('l'), _) => {
+                self.with_feature_form(|f| f.status_cursor_right());
+            }
+            (KeyCode::Enter, _) | (KeyCode::Char(' '), _) => {
+                self.with_feature_form(|f| f.apply_status_cursor());
+            }
+            (KeyCode::Char('x'), _) => {
+                self.with_feature_form(|f| f.cycle_status());
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_description_focus_key(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                self.with_feature_form(|f| f.focus_next());
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                self.with_feature_form(|f| f.focus_prev());
+            }
+            (KeyCode::Char('i'), _)
+            | (KeyCode::Enter, _)
+            | (KeyCode::Char('l'), _)
+            | (KeyCode::Right, _) => {
+                self.with_feature_form(|f| {
+                    let _ = f.open_description_editor();
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_text_focus_key(
+        &mut self,
+        key: KeyEvent,
+        focus: crate::views::feature_form::FormFocus,
+    ) -> Result<()> {
+        use crate::views::feature_form::FormFocus;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl {
+            return self.handle_text_focus_ctrl_key(key, focus);
+        }
+        match key.code {
+            KeyCode::Down => {
+                self.with_feature_form(|f| f.focus_next());
+            }
+            KeyCode::Up => {
+                self.with_feature_form(|f| f.focus_prev());
+            }
+            KeyCode::Left => {
+                self.with_feature_form(|f| f.move_caret_left());
+            }
+            KeyCode::Right => {
+                self.with_feature_form(|f| f.move_caret_right());
+            }
+            KeyCode::Home => {
+                self.with_feature_form(|f| f.move_caret_home());
+            }
+            KeyCode::End => {
+                self.with_feature_form(|f| f.move_caret_end());
+            }
+            KeyCode::Backspace => {
+                self.with_feature_form(|f| f.delete_char_backward());
+            }
+            KeyCode::Delete => {
+                self.with_feature_form(|f| {
+                    f.move_caret_right();
+                    f.delete_char_backward();
+                });
+            }
+            KeyCode::Enter => self.handle_text_focus_enter(focus),
+            KeyCode::Char(c) => {
+                self.with_feature_form(|f| f.insert_char(c));
+            }
+            _ => {}
+        }
+        let _ = FormFocus::Title;
+        Ok(())
+    }
+
+    fn handle_text_focus_ctrl_key(
+        &mut self,
+        key: KeyEvent,
+        focus: crate::views::feature_form::FormFocus,
+    ) -> Result<()> {
+        use crate::views::feature_form::FormFocus;
+        match key.code {
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                if matches!(focus, FormFocus::Step(_)) {
+                    self.with_feature_form(|f| f.cycle_step_status());
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                if matches!(focus, FormFocus::Step(_) | FormFocus::Comment(_)) {
+                    self.with_feature_form(|f| f.delete_focused());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_text_focus_enter(&mut self, focus: crate::views::feature_form::FormFocus) {
+        use crate::views::feature_form::FormFocus;
+        match focus {
+            FormFocus::NewStep => {
+                self.with_feature_form(|f| {
+                    let _ = f.commit_new_step();
+                });
+            }
+            FormFocus::NewComment => {
+                self.with_feature_form(|f| {
+                    let _ = f.commit_new_comment();
+                });
+            }
+            _ => {
+                self.with_feature_form(|f| f.focus_next());
+            }
+        }
+    }
+
+    fn on_key_feature_form_editor(&mut self, key: KeyEvent) -> Result<()> {
+        let close_keys = matches!(key.code, KeyCode::Esc | KeyCode::Backspace);
+        let normal_mode = self
+            .active_state_ref()
+            .and_then(|s| s.project_view.as_ref())
+            .and_then(|m| m.feature_form.as_ref())
+            .and_then(|f| f.editor.as_ref())
+            .map(|e| e.mode == EditorMode::Normal)
+            .unwrap_or(false);
+        if normal_mode && close_keys {
+            self.with_feature_form(|f| f.commit_description_editor());
+            return Ok(());
+        }
+        let pending_status = {
+            let Some(state) = self.active_state() else { return Ok(()) };
+            let Some(model) = state.project_view.as_mut() else { return Ok(()) };
+            let Some(form) = model.feature_form.as_mut() else { return Ok(()) };
+            let Some(editor) = form.editor.as_mut() else { return Ok(()) };
+            editor.handle_key(key);
+            editor.did_save = false;
+            editor.request_focus_tree = false;
+            std::mem::take(&mut editor.status)
+        };
+        if !pending_status.is_empty() {
+            self.status = pending_status;
+        }
+        Ok(())
+    }
+
+    fn with_feature_form(&mut self, mut f: impl FnMut(&mut crate::views::feature_form::FeatureForm)) {
+        if let Some(form) = self
+            .active_state()
+            .and_then(|s| s.project_view.as_mut())
+            .and_then(|m| m.feature_form.as_mut())
+        {
+            f(form);
+        }
+    }
+
+    fn project_move_down(&mut self) {
+        if let Some(model) = self
+            .active_state()
+            .and_then(|s| s.project_view.as_mut())
+        {
+            model.move_down();
+        }
+    }
+
+    fn project_move_up(&mut self) {
+        if let Some(model) = self
+            .active_state()
+            .and_then(|s| s.project_view.as_mut())
+        {
+            model.move_up();
+        }
+    }
+
+    fn project_jump_top(&mut self) {
+        if let Some(model) = self
+            .active_state()
+            .and_then(|s| s.project_view.as_mut())
+        {
+            model.jump_top();
+        }
+    }
+
+    fn project_jump_bottom(&mut self) {
+        if let Some(model) = self
+            .active_state()
+            .and_then(|s| s.project_view.as_mut())
+        {
+            model.jump_bottom();
+        }
+    }
+
+    fn project_begin_edit(&mut self) {
+        use crate::views::feature_form::FeatureForm;
+        use crate::views::project_view::{ProjectSection, ProjectSelection};
+        let Some(state) = self.active_state() else { return };
+        let Some(model) = state.project_view.as_mut() else { return };
+        match model.selection {
+            ProjectSelection::Meta(section) => {
+                let initial = match section {
+                    ProjectSection::About => model.meta.description.clone(),
+                    ProjectSection::Conventions => model.meta.conventions.clone(),
+                    ProjectSection::AiHints => model.meta.ai_hints.clone(),
+                    ProjectSection::AiNotes => model.meta.ai_notes.clone(),
+                };
+                let path = std::env::temp_dir().join("coffeetable_project_meta.md");
+                if let Ok(view) = EditorView::from_content(path, initial) {
+                    model.editor = Some(view);
+                    model.editing_section = Some(section);
+                }
+            }
+            ProjectSelection::NewFeature => {
+                model.feature_form = Some(FeatureForm::for_new());
+            }
+            ProjectSelection::Feature(i) => {
+                if let Some(feature) = model.features.get(i) {
+                    model.feature_form = Some(FeatureForm::for_existing(feature));
+                }
+            }
+        }
+    }
+
+    fn project_save_edit(&mut self) -> Result<()> {
+        use crate::views::project_view::ProjectSelection;
+        let Some(project) = self.active_project().cloned() else { return Ok(()) };
+        let has_form = self
+            .active_state_ref()
+            .and_then(|s| s.project_view.as_ref())
+            .map(|m| m.feature_form.is_some())
+            .unwrap_or(false);
+        if has_form {
+            return self.feature_form_save(project.id);
+        }
+        let (text, section) = {
+            let Some(state) = self.active_state() else { return Ok(()) };
+            let Some(model) = state.project_view.as_mut() else { return Ok(()) };
+            let editor = match model.editor.take() {
+                Some(e) => e,
+                None => return Ok(()),
+            };
+            let text = editor_text(&editor);
+            let section = model.editing_section.take();
+            (text, section)
+        };
+        if let Some(s) = section {
+            use crate::views::project_view::ProjectSection;
+            let Some(state) = self.active_state() else { return Ok(()) };
+            let Some(model) = state.project_view.as_mut() else { return Ok(()) };
+            if !matches!(model.selection, ProjectSelection::Meta(_)) {
+                return Ok(());
+            }
+            match s {
+                ProjectSection::About => model.meta.description = text.clone(),
+                ProjectSection::Conventions => model.meta.conventions = text.clone(),
+                ProjectSection::AiHints => model.meta.ai_hints = text.clone(),
+                ProjectSection::AiNotes => model.meta.ai_notes = text.clone(),
+            }
+            let meta = model.meta.clone();
+            self.db.save_project_meta(project.id, &meta)?;
+            self.status = "Saved".into();
+        }
+        Ok(())
+    }
+
+    fn feature_form_save(&mut self, project_id: i64) -> Result<()> {
+        if let Some(form) = self
+            .active_state()
+            .and_then(|s| s.project_view.as_mut())
+            .and_then(|m| m.feature_form.as_mut())
+        {
+            if form.description_editing() {
+                form.commit_description_editor();
+            }
+            let _ = form.commit_new_step();
+            let _ = form.commit_new_comment();
+        }
+        let form = {
+            let Some(state) = self.active_state() else { return Ok(()) };
+            let Some(model) = state.project_view.as_mut() else { return Ok(()) };
+            match model.feature_form.take() {
+                Some(f) => f,
+                None => return Ok(()),
+            }
+        };
+        let feature_id = self.persist_feature_form(project_id, &form)?;
+        self.reload_project_view()?;
+        self.focus_feature_row(feature_id);
+        self.status = "Feature saved".into();
+        Ok(())
+    }
+
+    fn persist_feature_form(
+        &mut self,
+        project_id: i64,
+        form: &crate::views::feature_form::FeatureForm,
+    ) -> Result<i64> {
+        let title = if form.title.trim().is_empty() {
+            "Untitled feature".to_string()
+        } else {
+            form.title.clone()
+        };
+        let feature_id = match form.feature_id {
+            Some(id) => {
+                self.db
+                    .update_feature(id, &title, &form.description, form.status)?;
+                id
+            }
+            None => self.db.insert_feature(project_id, &title)?,
+        };
+        if form.feature_id.is_none() {
+            self.db
+                .update_feature(feature_id, &title, &form.description, form.status)?;
+        }
+        for step in &form.steps {
+            match step.id {
+                Some(id) if step.deleted => self.db.delete_step(id)?,
+                Some(id) => self.db.update_step(id, &step.summary, step.status)?,
+                None if !step.deleted && !step.summary.trim().is_empty() => {
+                    let new_id = self.db.insert_step(feature_id, &step.summary)?;
+                    if step.status != crate::project::StepStatus::Todo {
+                        self.db.update_step(new_id, &step.summary, step.status)?;
+                    }
+                }
+                None => {}
+            }
+        }
+        for comment in &form.comments {
+            match comment.id {
+                Some(id) if comment.deleted => self.db.delete_comment(id)?,
+                Some(id) => self
+                    .db
+                    .update_comment(id, &comment.message, comment.status)?,
+                None if !comment.deleted && !comment.message.trim().is_empty() => {
+                    let new_id = self.db.insert_comment(feature_id, &comment.message)?;
+                    if comment.status != crate::project::CommentStatus::Queued {
+                        self.db
+                            .update_comment(new_id, &comment.message, comment.status)?;
+                    }
+                }
+                None => {}
+            }
+        }
+        Ok(feature_id)
+    }
+
+    fn focus_feature_row(&mut self, feature_id: i64) {
+        if let Some(model) = self
+            .active_state()
+            .and_then(|s| s.project_view.as_mut())
+        {
+            if let Some(pos) = model.features.iter().position(|f| f.id == feature_id) {
+                let row = crate::views::project_view::ProjectSection::all().len() + 1 + pos;
+                model.list_state.select(Some(row));
+                model.sync_selection_from_list();
+            }
+        }
+    }
+
+    fn project_close_form(&mut self) -> Result<()> {
+        let Some(project) = self.active_project().cloned() else { return Ok(()) };
+        let dirty = self
+            .active_state_ref()
+            .and_then(|s| s.project_view.as_ref())
+            .and_then(|m| m.feature_form.as_ref())
+            .map(|f| {
+                f.dirty
+                    || f.description_editing()
+                    || !f.new_step_buf.trim().is_empty()
+                    || !f.new_comment_buf.trim().is_empty()
+            })
+            .unwrap_or(false);
+        if dirty {
+            self.feature_form_save(project.id)?;
+        } else if let Some(state) = self.active_state() {
+            if let Some(model) = state.project_view.as_mut() {
+                model.feature_form = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn project_add_feature(&mut self) -> Result<()> {
+        use crate::views::project_view::{ProjectSection, ProjectSelection};
+        let sections = ProjectSection::all().len();
+        if let Some(model) = self
+            .active_state()
+            .and_then(|s| s.project_view.as_mut())
+        {
+            model.list_state.select(Some(sections));
+            model.selection = ProjectSelection::NewFeature;
+        }
+        self.project_begin_edit();
+        Ok(())
+    }
+
+    fn project_cycle_status(&mut self) -> Result<()> {
+        let Some(project) = self.active_project().cloned() else { return Ok(()) };
+        let payload = {
+            let Some(state) = self.active_state() else { return Ok(()) };
+            let Some(model) = state.project_view.as_mut() else { return Ok(()) };
+            let Some(i) = (match model.selection {
+                crate::views::project_view::ProjectSelection::Feature(i) => Some(i),
+                _ => None,
+            }) else {
+                return Ok(());
+            };
+            let Some(feature) = model.features.get_mut(i) else { return Ok(()) };
+            feature.status = feature.status.next();
+            (
+                feature.id,
+                feature.title.clone(),
+                feature.description.clone(),
+                feature.status,
+            )
+        };
+        self.db
+            .update_feature(payload.0, &payload.1, &payload.2, payload.3)?;
+        let _ = project;
+        Ok(())
+    }
+
+    fn project_delete_selected(&mut self) -> Result<()> {
+        use crate::views::project_view::ProjectSelection;
+        let id = {
+            let Some(state) = self.active_state() else { return Ok(()) };
+            let Some(model) = state.project_view.as_mut() else { return Ok(()) };
+            match model.selection {
+                ProjectSelection::Feature(i) => model.features.get(i).map(|f| f.id),
+                _ => None,
+            }
+        };
+        if let Some(id) = id {
+            self.db.delete_feature(id)?;
+            self.reload_project_view()?;
+        }
+        Ok(())
+    }
+
+    fn reload_project_view(&mut self) -> Result<()> {
+        let Some(project) = self.active_project().cloned() else { return Ok(()) };
+        let meta = self.db.load_project_meta(project.id)?;
+        let features = self.db.list_features(project.id)?;
+        if let Some(state) = self.active_state() {
+            if let Some(model) = state.project_view.as_mut() {
+                let prev_sel = model.list_state.selected();
+                model.meta = meta;
+                model.features = features;
+                let total = model.rows();
+                if let Some(idx) = prev_sel {
+                    model.list_state.select(Some(idx.min(total.saturating_sub(1))));
+                }
+                model.sync_selection_from_list();
+            }
+        }
+        Ok(())
+    }
+
+    fn write_to_active_terminal(&mut self, bytes: &[u8]) {
+        if let Some(state) = self.active_state() {
+            if let Some(i) = state.active_terminal {
+                if let Some(term) = state.terminals.get_mut(i) {
+                    term.write_bytes(bytes);
+                }
+            }
+        }
     }
 
     fn open_explorer_filter(&mut self) {
