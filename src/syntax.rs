@@ -6,7 +6,7 @@ use syntect::highlighting::{
 };
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
-const DARCULA_THEME_XML: &str = include_str!("../assets/darcula.tmTheme");
+const THEME_XML: &str = include_str!("../assets/gruvbox-custom.tmTheme");
 
 fn syntax_set() -> &'static SyntaxSet {
     static SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -16,7 +16,7 @@ fn syntax_set() -> &'static SyntaxSet {
 fn theme() -> &'static Theme {
     static THEME: OnceLock<Theme> = OnceLock::new();
     THEME.get_or_init(|| {
-        let mut reader = std::io::Cursor::new(DARCULA_THEME_XML.as_bytes());
+        let mut reader = std::io::Cursor::new(THEME_XML.as_bytes());
         match ThemeSet::load_from_reader(&mut reader) {
             Ok(t) => t,
             Err(_) => {
