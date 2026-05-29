@@ -409,7 +409,11 @@ impl<'a> Widget for ChangesWidget<'a> {
                         let expanded = !self.view.collapsed.contains(path);
                         let indent = "  ".repeat(*depth as usize);
                         ListItem::new(Line::from(vec![
-                            Span::raw(format!("  {}{}  ", indent, icons::folder(expanded))),
+                            Span::raw(format!("  {}", indent)),
+                            Span::styled(
+                                format!("{}  ", icons::folder(expanded)),
+                                Style::default().fg(icons::folder_color()),
+                            ),
                             Span::raw(format!("{}/", name)),
                         ]))
                     }
@@ -442,11 +446,16 @@ impl<'a> Widget for ChangesWidget<'a> {
                             GitStatus::Deleted => Style::default().fg(Color::Red),
                         };
                         let icon = icons::for_file(name);
+                        let icon_color = icons::color_for_file(name);
                         let left_text = format!("  {}{}  {}", indent, icon, name);
                         let used = left_text.chars().count() + badge.chars().count();
                         let pad = row_width.saturating_sub(used + 1).max(1);
                         ListItem::new(Line::from(vec![
-                            Span::raw(format!("  {}{}  ", indent, icon)),
+                            Span::raw(format!("  {}", indent)),
+                            Span::styled(
+                                format!("{}  ", icon),
+                                Style::default().fg(icon_color),
+                            ),
                             Span::styled(name.clone(), name_style),
                             Span::raw(" ".repeat(pad)),
                             Span::styled(badge.to_string(), badge_style),

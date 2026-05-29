@@ -404,26 +404,25 @@ impl<'a> Widget for FileTreeWidget<'a> {
             .iter()
             .map(|n| {
                 let indent = "  ".repeat(n.depth as usize);
-                let icon = if n.is_dir {
-                    icons::folder(n.is_expanded)
+                let (icon, icon_color) = if n.is_dir {
+                    (icons::folder(n.is_expanded), icons::folder_color())
                 } else {
-                    icons::for_file(&n.name)
+                    (icons::for_file(&n.name), icons::color_for_file(&n.name))
                 };
-                let marker = format!("{}  ", icon);
                 let status = node_status(&self.view.git_status, &n.path, n.is_dir);
-                let style = match (n.is_dir, status) {
-                    (_, Some(GitStatus::Untracked)) => Style::default().fg(Color::Red),
-                    (_, Some(GitStatus::Deleted)) => Style::default()
+                let name_style = match status {
+                    Some(GitStatus::Untracked) => Style::default().fg(Color::Red),
+                    Some(GitStatus::Deleted) => Style::default()
                         .fg(Color::Red)
                         .add_modifier(Modifier::CROSSED_OUT),
-                    (_, Some(GitStatus::Modified)) => Style::default().fg(Color::Yellow),
-                    (_, Some(GitStatus::Staged)) => Style::default().fg(Color::Green),
-                    (_, None) => Style::default(),
+                    Some(GitStatus::Modified) => Style::default().fg(Color::Yellow),
+                    Some(GitStatus::Staged) => Style::default().fg(Color::Green),
+                    None => Style::default(),
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw(indent),
-                    Span::raw(marker),
-                    Span::styled(n.name.clone(), style),
+                    Span::styled(format!("{}  ", icon), Style::default().fg(icon_color)),
+                    Span::styled(n.name.clone(), name_style),
                 ]))
             })
             .collect();
