@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, AppMode, Focus, LeftPaneMode},
+    app::{AiCommitState, App, AppMode, Focus, LeftPaneMode},
     views::{
         changes::ChangesWidget,
         editor::{COMMANDS, EditorMode, EditorWidget, filter_commands, render_command_line},
@@ -38,6 +38,7 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         AppMode::Grep => render_grep_overlay(app, frame, area),
         AppMode::OpenConfirm => render_open_confirm_overlay(app, frame, area),
         AppMode::Palette => render_command_palette_overlay(app, frame, area),
+        AppMode::AiCommit => render_ai_commit_overlay(app, frame, area),
         AppMode::Normal | AppMode::ExplorerFilter => {}
     }
     if app.leader_pending {
@@ -139,6 +140,7 @@ fn render_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
         ("w", "Show Working copy (editor)"),
         ("h", "Show HEAD version (editor)"),
         ("d", "Show Diff vs HEAD (editor)"),
+        ("C", "AI commit (generate message, review, commit)"),
         ("?", "Help"),
         ("q", "Quit"),
     ];
@@ -395,13 +397,7 @@ fn push_dir_entries(
         } else {
             ("  ", Style::default().fg(Color::DarkGray))
         };
-        let name_style = if is_dir {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
+        let name_style = Style::default();
         let display = if is_dir {
             format!("{}/", name)
         } else {
@@ -504,6 +500,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         AppMode::OpenConfirm => "y / Enter open  •  n / Esc cancel".into(),
         AppMode::Palette => "↑/↓ select  •  Enter run  •  ! suffix forces  •  Esc cancel".into(),
         AppMode::ExplorerFilter => "Type to narrow  •  ↑/↓ select  •  Enter open  •  Esc clear+exit".into(),
+        AppMode::AiCommit => "y / Enter commit  •  r regenerate  •  Esc cancel".into(),
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -549,6 +546,83 @@ fn render_filter_input(area: Rect, query: &str, focused: bool, frame: &mut Frame
                 .title(title),
         );
     frame.render_widget(para, area);
+}
+
+fn render_ai_commit_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(overlay) = app.ai_commit.as_ref() else { return };
+    let popup = centered_rect(70, 60, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(" AI commit ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    match &overlay.state {
+        AiCommitState::Loading { spinner, .. } => {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let sp = frames[spinner % frames.len()];
+            let lines = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(sp.to_string(), Style::default().fg(Color::Yellow)),
+                    Span::raw("  Generating commit message via "),
+                    Span::styled(
+                        app.ai_config.provider.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("..."),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Esc cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        AiCommitState::Reviewing { message } => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(2)])
+                .split(inner);
+            let mut lines = vec![Line::from("")];
+            for l in message.lines() {
+                lines.push(Line::from(format!("  {}", l)));
+            }
+            frame.render_widget(Paragraph::new(lines), chunks[0]);
+            frame.render_widget(
+                Paragraph::new(
+                    "  y / Enter commit  •  r regenerate  •  Esc cancel",
+                )
+                .style(Style::default().fg(Color::DarkGray)),
+                chunks[1],
+            );
+        }
+        AiCommitState::Error(e) => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "Error: ",
+                        Style::default()
+                            .fg(Color::Red)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(e.clone()),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  r retry  •  Esc cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+    }
 }
 
 fn render_open_confirm_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -713,6 +787,14 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
             vec![
                 ("y / Enter", "open anyway"),
                 ("n / Esc", "cancel"),
+            ],
+        ),
+        AppMode::AiCommit => (
+            "AI commit",
+            vec![
+                ("y / Enter", "run git commit with proposed message"),
+                ("r", "regenerate"),
+                ("Esc", "cancel"),
             ],
         ),
         AppMode::Palette => (

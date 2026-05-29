@@ -1,4 +1,4 @@
-use crate::{git::GitStatus, project::FileTreeState};
+use crate::{git::GitStatus, icons, project::FileTreeState};
 use anyhow::Result;
 use ratatui::{
     buffer::Buffer,
@@ -369,20 +369,24 @@ fn node_status(
         let mut best: Option<GitStatus> = None;
         for (p, s) in status {
             if p.starts_with(path) {
-                best = Some(match (best, *s) {
-                    (None, s) => s,
-                    (Some(GitStatus::Untracked), _) => GitStatus::Untracked,
-                    (_, GitStatus::Untracked) => GitStatus::Untracked,
-                    (Some(GitStatus::Modified), _) => GitStatus::Modified,
-                    (_, GitStatus::Modified) => GitStatus::Modified,
-                    (Some(GitStatus::Staged), GitStatus::Staged) => GitStatus::Staged,
-                });
+                best = Some(merge_status(best, *s));
             }
         }
         best
     } else {
         status.get(path).copied()
     }
+}
+
+fn merge_status(current: Option<GitStatus>, new: GitStatus) -> GitStatus {
+    let Some(current) = current else { return new };
+    let rank = |s: GitStatus| match s {
+        GitStatus::Untracked => 4,
+        GitStatus::Deleted => 3,
+        GitStatus::Modified => 2,
+        GitStatus::Staged => 1,
+    };
+    if rank(new) > rank(current) { new } else { current }
 }
 
 pub struct FileTreeWidget<'a> {
@@ -400,23 +404,21 @@ impl<'a> Widget for FileTreeWidget<'a> {
             .iter()
             .map(|n| {
                 let indent = "  ".repeat(n.depth as usize);
-                let marker = if n.is_dir {
-                    if n.is_expanded { "▾ " } else { "▸ " }
+                let icon = if n.is_dir {
+                    icons::folder(n.is_expanded)
                 } else {
-                    "  "
+                    icons::for_file(&n.name)
                 };
+                let marker = format!("{}  ", icon);
                 let status = node_status(&self.view.git_status, &n.path, n.is_dir);
                 let style = match (n.is_dir, status) {
                     (_, Some(GitStatus::Untracked)) => Style::default().fg(Color::Red),
+                    (_, Some(GitStatus::Deleted)) => Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT),
                     (_, Some(GitStatus::Modified)) => Style::default().fg(Color::Yellow),
                     (_, Some(GitStatus::Staged)) => Style::default().fg(Color::Green),
-                    (true, None) => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    (false, None) => Style::default(),
-                };
-                let style = if n.is_dir {
-                    style.add_modifier(Modifier::BOLD)
-                } else {
-                    style
+                    (_, None) => Style::default(),
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw(indent),

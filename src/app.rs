@@ -26,6 +26,23 @@ pub enum AppMode {
     OpenConfirm,
     Palette,
     ExplorerFilter,
+    AiCommit,
+}
+
+pub enum AiCommitState {
+    Loading {
+        rx: std::sync::mpsc::Receiver<Result<String, String>>,
+        spinner: usize,
+    },
+    Reviewing {
+        message: String,
+    },
+    Error(String),
+}
+
+pub struct AiCommitOverlay {
+    pub state: AiCommitState,
+    pub project_path: PathBuf,
 }
 
 #[derive(Default)]
@@ -58,6 +75,7 @@ pub struct ProjectViewState {
     pub left_pane: LeftPaneMode,
     pub editor: Option<EditorView>,
     pub focus: Focus,
+    pub preferred_git_view: GitView,
 }
 
 impl ProjectViewState {
@@ -79,6 +97,7 @@ pub struct App {
     pub settings_path: PathBuf,
     pub roots: Vec<PathBuf>,
     pub search_excludes: Vec<String>,
+    pub ai_config: crate::config::AiConfig,
     pub open_projects: Vec<Project>,
     pub active_index: usize,
     pub project_views: HashMap<i64, ProjectViewState>,
@@ -86,6 +105,7 @@ pub struct App {
     pub picker: Option<ProjectPicker>,
     pub grep: Option<GrepView>,
     pub palette: Option<PaletteState>,
+    pub ai_commit: Option<AiCommitOverlay>,
     pub pending_open: Option<PendingOpen>,
     pub should_quit: bool,
     pub status: String,
@@ -102,6 +122,7 @@ impl App {
         let settings = Settings::load_or_seed(&settings_path)?;
         let roots = settings.roots;
         let search_excludes = settings.search_excludes;
+        let ai_config = settings.ai;
         let (open_ids, active_id) = db.load_open_projects()?;
         let all = db.list_projects()?;
         let open_projects: Vec<Project> = open_ids
@@ -128,6 +149,7 @@ impl App {
                     left_pane: LeftPaneMode::Tree,
                     editor: None,
                     focus: Focus::Tree,
+                    preferred_git_view: GitView::Working,
                 },
             );
         }
@@ -148,6 +170,7 @@ impl App {
             settings_path,
             roots,
             search_excludes,
+            ai_config,
             open_projects,
             active_index,
             project_views,
@@ -155,6 +178,7 @@ impl App {
             picker,
             grep: None,
             palette: None,
+            ai_commit: None,
             pending_open: None,
             should_quit: false,
             status: String::new(),
@@ -219,6 +243,7 @@ impl App {
             AppMode::OpenConfirm => self.on_key_open_confirm(key)?,
             AppMode::Palette => self.on_key_palette(key)?,
             AppMode::ExplorerFilter => self.on_key_explorer_filter(key)?,
+            AppMode::AiCommit => self.on_key_ai_commit(key)?,
             AppMode::Normal => self.on_key_normal(key)?,
         }
         Ok(())
@@ -403,7 +428,10 @@ impl App {
             return;
         };
         match git::show_head(&project_path, rel) {
-            Some(content) => self.apply_alt_view(GitView::Head, content),
+            Some(content) => {
+                self.apply_alt_view(GitView::Head, content);
+                self.remember_preferred_view(GitView::Head);
+            }
             None => self.status = "Could not read HEAD version (file untracked?)".into(),
         }
     }
@@ -418,7 +446,8 @@ impl App {
         };
         match git::file_diff_head(&project_path, rel) {
             Some(content) if !content.is_empty() => {
-                self.apply_alt_view(GitView::Diff, prettify_diff(&content))
+                self.apply_alt_view(GitView::Diff, prettify_diff(&content));
+                self.remember_preferred_view(GitView::Diff);
             }
             Some(_) => self.status = "No changes against HEAD".into(),
             None => self.status = "Could not produce diff".into(),
@@ -435,6 +464,32 @@ impl App {
             return;
         };
         editor.show_working();
+        self.remember_preferred_view(GitView::Working);
+    }
+
+    fn remember_preferred_view(&mut self, view: GitView) {
+        if let Some(state) = self.active_state() {
+            state.preferred_git_view = view;
+        }
+    }
+
+    fn apply_preferred_view_in_changes(&mut self) {
+        let preferred = self
+            .active_state_ref()
+            .map(|s| s.preferred_git_view)
+            .unwrap_or(GitView::Working);
+        let in_changes = self
+            .active_state_ref()
+            .map(|s| matches!(s.left_pane, LeftPaneMode::Changes))
+            .unwrap_or(false);
+        if !in_changes {
+            return;
+        }
+        match preferred {
+            GitView::Working => {}
+            GitView::Head => self.palette_show_head(),
+            GitView::Diff => self.palette_show_diff(),
+        }
     }
 
     fn editor_file_in_project(&mut self) -> Option<(PathBuf, PathBuf)> {
@@ -531,6 +586,7 @@ impl App {
             KeyCode::Char('e') => self.focus_tree(),
             KeyCode::Char('b') => self.focus_editor(),
             KeyCode::Char('c') => self.toggle_left_pane(),
+            KeyCode::Char('C') => self.start_ai_commit()?,
             KeyCode::Char('w') => self.palette_show_working(),
             KeyCode::Char('h') => self.palette_show_head(),
             KeyCode::Char('d') => self.palette_show_diff(),
@@ -566,6 +622,7 @@ impl App {
         let s = Settings {
             roots: self.roots.clone(),
             search_excludes: self.search_excludes.clone(),
+            ai: self.ai_config.clone(),
         };
         s.save(&self.settings_path)
     }
@@ -681,9 +738,6 @@ impl App {
             .map(|s| s.left_pane)
             .unwrap_or(LeftPaneMode::Tree);
         let _ = col;
-        if let Some(s) = self.active_state() {
-            s.focus = Focus::Tree;
-        }
         let action = if let Some(s) = self.active_state() {
             match pane {
                 LeftPaneMode::Tree => match s.tree.mouse_select(row) {
@@ -702,6 +756,9 @@ impl App {
             self.open_file_in_editor(path)?;
         } else {
             self.preview_selected()?;
+        }
+        if let Some(s) = self.active_state() {
+            s.focus = Focus::Tree;
         }
         self.persist_active_tree()?;
         Ok(())
@@ -791,7 +848,11 @@ impl App {
                 }
                 true
             }
-            AppMode::Grep | AppMode::OpenConfirm | AppMode::Palette | AppMode::ExplorerFilter => false,
+            AppMode::Grep
+            | AppMode::OpenConfirm
+            | AppMode::Palette
+            | AppMode::ExplorerFilter
+            | AppMode::AiCommit => false,
             AppMode::Normal => {
                 if let Some(state) = self.active_state_ref() {
                     if state.focus == Focus::Editor {
@@ -871,13 +932,9 @@ impl App {
                     self.persist_active_tree()?;
                 }
                 LeftPaneMode::Changes => {
-                    let path = self
-                        .active_state_ref()
-                        .and_then(|s| s.changes.selected_path().map(|p| p.to_path_buf()));
-                    if let Some(p) = path {
-                        if p.is_file() {
-                            self.open_file_in_editor(p)?;
-                        }
+                    let action = self.active_state().map(|s| s.changes.toggle_or_open());
+                    if let Some(crate::views::changes::ChangesAction::OpenFile(p)) = action {
+                        self.open_file_in_editor(p)?;
                     }
                 }
             },
@@ -899,7 +956,177 @@ impl App {
                     }
                 }
             }
+            (KeyCode::Char('y'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                if matches!(pane, LeftPaneMode::Changes) {
+                    self.toggle_stage_selected()?;
+                }
+            }
+            (KeyCode::Char('Y'), _) => {
+                if matches!(pane, LeftPaneMode::Changes) {
+                    self.toggle_stage_all()?;
+                }
+            }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn toggle_stage_selected(&mut self) -> Result<()> {
+        let Some(project) = self.active_project().cloned() else {
+            return Ok(());
+        };
+        let Some(path) = self
+            .active_state_ref()
+            .and_then(|s| s.selected_path().map(|p| p.to_path_buf()))
+        else {
+            return Ok(());
+        };
+        let rel = path
+            .strip_prefix(&project.path)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| path.clone());
+        let was_staged = git::has_staged_changes(&project.path, &rel);
+        let ok = if was_staged {
+            git::unstage(&project.path, &rel)
+        } else {
+            git::stage(&project.path, &rel)
+        };
+        if ok {
+            self.status = if was_staged {
+                format!("Unstaged {}", rel.display())
+            } else {
+                format!("Staged {}", rel.display())
+            };
+            self.refresh_git_status()?;
+            if let Some(state) = self.active_state() {
+                state.changes.select_path_external(&path);
+            }
+        } else {
+            self.status = "git command failed".into();
+        }
+        Ok(())
+    }
+
+    pub fn tick(&mut self) {
+        self.poll_ai_commit();
+    }
+
+    fn poll_ai_commit(&mut self) {
+        let Some(overlay) = self.ai_commit.as_mut() else { return };
+        let new_state = if let AiCommitState::Loading { rx, spinner } = &mut overlay.state {
+            *spinner = spinner.wrapping_add(1);
+            match rx.try_recv() {
+                Ok(Ok(msg)) => Some(AiCommitState::Reviewing { message: msg }),
+                Ok(Err(e)) => Some(AiCommitState::Error(e)),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(s) = new_state {
+            overlay.state = s;
+        }
+    }
+
+    fn start_ai_commit(&mut self) -> Result<()> {
+        let Some(project) = self.active_project().cloned() else {
+            self.status = "No active project".into();
+            return Ok(());
+        };
+        let Some(diff) = git::staged_diff(&project.path) else {
+            self.status = "git diff --staged failed".into();
+            return Ok(());
+        };
+        if diff.trim().is_empty() {
+            self.status = "Nothing staged — stage changes first (c on a file)".into();
+            return Ok(());
+        }
+        let provider = match crate::ai::build_provider(&self.ai_config) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("AI provider error: {}", e);
+                return Ok(());
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = provider
+                .generate_commit_message(&diff)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.ai_commit = Some(AiCommitOverlay {
+            state: AiCommitState::Loading { rx, spinner: 0 },
+            project_path: project.path,
+        });
+        self.mode = AppMode::AiCommit;
+        Ok(())
+    }
+
+    fn on_key_ai_commit(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(overlay) = self.ai_commit.as_mut() else {
+            self.mode = AppMode::Normal;
+            return Ok(());
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.ai_commit = None;
+                self.mode = AppMode::Normal;
+                self.status = "AI commit cancelled".into();
+            }
+            (KeyCode::Char('y'), _) | (KeyCode::Enter, _) => {
+                if let AiCommitState::Reviewing { message } = &overlay.state {
+                    let msg = message.clone();
+                    let project_path = overlay.project_path.clone();
+                    self.ai_commit = None;
+                    self.mode = AppMode::Normal;
+                    match git::commit_with_message(&project_path, &msg) {
+                        Ok(_) => {
+                            let first_line =
+                                msg.lines().next().unwrap_or("").to_string();
+                            self.status = format!("Committed: {}", first_line);
+                            let _ = self.refresh_git_status();
+                        }
+                        Err(e) => {
+                            self.status = format!("git commit failed: {}", e.lines().next().unwrap_or(""))
+                        }
+                    }
+                }
+            }
+            (KeyCode::Char('r'), _) => {
+                if matches!(
+                    overlay.state,
+                    AiCommitState::Reviewing { .. } | AiCommitState::Error(_)
+                ) {
+                    self.ai_commit = None;
+                    self.mode = AppMode::Normal;
+                    self.start_ai_commit()?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn toggle_stage_all(&mut self) -> Result<()> {
+        let Some(project) = self.active_project().cloned() else {
+            return Ok(());
+        };
+        let any_staged = git::any_staged_changes(&project.path);
+        let ok = if any_staged {
+            git::unstage_all(&project.path)
+        } else {
+            git::stage_all(&project.path)
+        };
+        if ok {
+            self.status = if any_staged {
+                "Unstaged all".into()
+            } else {
+                "Staged all".into()
+            };
+            self.refresh_git_status()?;
+        } else {
+            self.status = "git command failed".into();
         }
         Ok(())
     }
@@ -1016,6 +1243,7 @@ impl App {
                     state.focus = Focus::Editor;
                 }
                 self.status = format!("Opened {}", path.display());
+                self.apply_preferred_view_in_changes();
             }
             Err(e) => {
                 self.status = format!("Could not open {}: {}", path.display(), e);
@@ -1072,6 +1300,7 @@ impl App {
             if let Some(state) = self.active_state() {
                 state.set_editor(view);
             }
+            self.apply_preferred_view_in_changes();
         }
     }
 
@@ -1386,6 +1615,7 @@ impl App {
                     left_pane: LeftPaneMode::Tree,
                     editor: None,
                     focus: Focus::Tree,
+                    preferred_git_view: GitView::Working,
                 },
             );
             self.open_projects.push(project);

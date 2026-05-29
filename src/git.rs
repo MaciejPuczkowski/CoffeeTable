@@ -9,6 +9,7 @@ pub enum GitStatus {
     Untracked,
     Modified,
     Staged,
+    Deleted,
 }
 
 pub fn fetch_status(root: &Path) -> HashMap<PathBuf, GitStatus> {
@@ -41,6 +42,8 @@ fn parse_porcelain(bytes: &[u8], root: &Path) -> HashMap<PathBuf, GitStatus> {
         let path = root.join(&name);
         let status = if x == '?' && y == '?' {
             GitStatus::Untracked
+        } else if x == 'D' || y == 'D' {
+            GitStatus::Deleted
         } else if y != ' ' {
             GitStatus::Modified
         } else if x != ' ' {
@@ -92,6 +95,130 @@ pub fn file_diff_head(repo: &Path, rel: &Path) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub fn staged_diff(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--staged"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+pub fn commit_with_message(repo: &Path, message: &str) -> Result<(), String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("commit")
+        .arg("-m")
+        .arg(message)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    Ok(())
+}
+
+pub fn stage(repo: &Path, rel: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("add")
+        .arg("--")
+        .arg(rel)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn unstage(repo: &Path, rel: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["restore", "--staged", "--"])
+        .arg(rel)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn stage_all(repo: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["add", "-A"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn unstage_all(repo: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["restore", "--staged", "."])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn any_staged_changes(repo: &Path) -> bool {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["status", "--porcelain"])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let bytes = line.as_bytes();
+        if bytes.len() < 2 {
+            continue;
+        }
+        let x = bytes[0] as char;
+        if x != ' ' && x != '?' {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn has_staged_changes(repo: &Path, rel: &Path) -> bool {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["status", "--porcelain", "--"])
+        .arg(rel)
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let bytes = line.as_bytes();
+        if bytes.len() < 2 {
+            continue;
+        }
+        let x = bytes[0] as char;
+        if x != ' ' && x != '?' {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn detect_github_url(project_path: &Path) -> Option<String> {

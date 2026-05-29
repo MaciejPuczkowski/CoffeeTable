@@ -1,9 +1,11 @@
+mod ai;
 mod app;
 mod clipboard;
 mod config;
 mod db;
 mod discovery;
 mod git;
+mod icons;
 mod project;
 mod syntax;
 mod ui;
@@ -57,6 +59,7 @@ fn run(
     app: &mut App,
 ) -> Result<()> {
     loop {
+        app.tick();
         terminal.draw(|f| ui::render(app, f))?;
 
         if event::poll(Duration::from_millis(200))? {

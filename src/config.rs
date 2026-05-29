@@ -30,6 +30,39 @@ pub struct Settings {
     pub roots: Vec<PathBuf>,
     #[serde(default = "default_search_excludes")]
     pub search_excludes: Vec<String>,
+    #[serde(default)]
+    pub ai: AiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    #[serde(default = "default_ai_provider")]
+    pub provider: String,
+    #[serde(default = "default_ai_binary")]
+    pub binary: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_ai_provider(),
+            binary: default_ai_binary(),
+            model: None,
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+fn default_ai_provider() -> String {
+    "claude_cli".into()
+}
+
+fn default_ai_binary() -> String {
+    "claude".into()
 }
 
 impl Settings {
@@ -58,6 +91,7 @@ impl Settings {
         Self {
             roots: default_roots(),
             search_excludes: default_search_excludes(),
+            ai: AiConfig::default(),
         }
     }
 }
