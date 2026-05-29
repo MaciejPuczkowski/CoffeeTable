@@ -117,6 +117,13 @@ impl EditorView {
         self.modified = true;
     }
 
+    pub fn copy_current(&mut self) {
+        match self.mode {
+            EditorMode::Visual | EditorMode::VisualLine => self.yank_selection(),
+            _ => self.yank_line(),
+        }
+    }
+
     pub(super) fn yank_line(&mut self) {
         let text: String = self.lines[self.cursor.0].iter().collect();
         self.yank = YankRegister {

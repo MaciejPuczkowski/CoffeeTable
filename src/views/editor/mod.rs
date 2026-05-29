@@ -11,7 +11,7 @@ mod mouse;
 mod types;
 mod widget;
 
-pub use types::{COMMANDS, EditorMode, EditorRequest, filter_commands};
+pub use types::{COMMANDS, EditorMode, GitView, filter_commands};
 pub use widget::{EditorWidget, render_command_line};
 
 use types::{Snapshot, YankRegister};
@@ -22,7 +22,6 @@ pub struct EditorView {
     pub cursor: (usize, usize),
     pub mode: EditorMode,
     pub anchor: Option<(usize, usize)>,
-    pub command: String,
     pub search: String,
     pub last_search: Option<String>,
     pub yank: YankRegister,
@@ -37,13 +36,17 @@ pub struct EditorView {
     pub pending_d: bool,
     pub pending_y: bool,
     pub preferred_col: usize,
-    pub close_requested: bool,
-    pub quit_app_requested: bool,
     pub focused: bool,
-    pub command_selection: usize,
-    pub pending_request: Option<EditorRequest>,
     pub did_save: bool,
+    pub request_focus_tree: bool,
+    pub git_view: GitView,
+    pub working_lines: Option<Vec<Vec<char>>>,
+    pub working_cursor: Option<(usize, usize)>,
+    pub working_scroll: Option<(usize, usize)>,
     pub last_render_area: Option<Rect>,
+    pub pill_working: Option<Rect>,
+    pub pill_head: Option<Rect>,
+    pub pill_diff: Option<Rect>,
     pub gutter_width: u16,
     pub highlighter: Highlighter,
 }
@@ -66,7 +69,6 @@ impl EditorView {
             cursor: (0, 0),
             mode: EditorMode::Normal,
             anchor: None,
-            command: String::new(),
             search: String::new(),
             last_search: None,
             yank: YankRegister::default(),
@@ -81,28 +83,83 @@ impl EditorView {
             pending_d: false,
             pending_y: false,
             preferred_col: 0,
-            close_requested: false,
-            quit_app_requested: false,
             focused: true,
-            command_selection: 0,
-            pending_request: None,
             did_save: false,
+            request_focus_tree: false,
+            git_view: GitView::Working,
+            working_lines: None,
+            working_cursor: None,
+            working_scroll: None,
             last_render_area: None,
+            pill_working: None,
+            pill_head: None,
+            pill_diff: None,
             gutter_width: 0,
             highlighter,
         })
     }
 
+    pub fn show_alt_view(&mut self, view: GitView, raw: String) {
+        if self.git_view == GitView::Working {
+            self.working_lines = Some(self.lines.clone());
+            self.working_cursor = Some(self.cursor);
+            self.working_scroll = Some((self.scroll_row, self.scroll_col));
+        }
+        let mut lines = parse_lines(&raw);
+        if lines.is_empty() {
+            lines.push(Vec::new());
+        }
+        self.lines = lines;
+        self.cursor = (0, 0);
+        self.scroll_row = 0;
+        self.scroll_col = 0;
+        self.preferred_col = 0;
+        self.mode = EditorMode::Normal;
+        self.anchor = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.git_view = view;
+        let ext = if matches!(view, GitView::Diff) {
+            "diff"
+        } else {
+            self.path.extension().and_then(|s| s.to_str()).unwrap_or("")
+        };
+        self.highlighter = Highlighter::for_extension(ext);
+    }
+
+    pub fn show_working(&mut self) {
+        if matches!(self.git_view, GitView::Working) {
+            return;
+        }
+        if let Some(saved) = self.working_lines.take() {
+            self.lines = saved;
+        }
+        if let Some(cur) = self.working_cursor.take() {
+            self.cursor = cur;
+            self.preferred_col = cur.1;
+        }
+        if let Some((r, c)) = self.working_scroll.take() {
+            self.scroll_row = r;
+            self.scroll_col = c;
+        }
+        self.git_view = GitView::Working;
+        let ext = self.path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        self.highlighter = Highlighter::for_extension(ext);
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
-        if !matches!(self.mode, EditorMode::Command | EditorMode::Search) {
+        if !matches!(self.mode, EditorMode::Search) {
             self.status.clear();
         }
-        match self.mode {
-            EditorMode::Normal => self.normal_key(key),
-            EditorMode::Insert => self.insert_key(key),
-            EditorMode::Visual | EditorMode::VisualLine => self.visual_key(key),
-            EditorMode::Command => self.command_key(key),
-            EditorMode::Search => self.search_key(key),
+        if matches!(self.git_view, GitView::Head | GitView::Diff) {
+            self.readonly_key(key);
+        } else {
+            match self.mode {
+                EditorMode::Normal => self.normal_key(key),
+                EditorMode::Insert => self.insert_key(key),
+                EditorMode::Visual | EditorMode::VisualLine => self.visual_key(key),
+                EditorMode::Search => self.search_key(key),
+            }
         }
         self.clamp_cursor();
     }
@@ -128,7 +185,6 @@ impl EditorView {
             EditorMode::Insert => "INSERT",
             EditorMode::Visual => "VISUAL",
             EditorMode::VisualLine => "V-LINE",
-            EditorMode::Command => "COMMAND",
             EditorMode::Search => "SEARCH",
         }
     }
@@ -167,7 +223,7 @@ impl EditorView {
         }
     }
 
-    pub(super) fn reload(&mut self, force: bool) {
+    pub fn reload(&mut self, force: bool) {
         if self.modified && !force {
             self.status = "Unsaved changes (e! to discard)".into();
             return;

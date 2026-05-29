@@ -65,6 +65,35 @@ fn parse_path_field(field: &str) -> String {
     trimmed.to_string()
 }
 
+pub fn show_head(repo: &Path, rel: &Path) -> Option<String> {
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("show")
+        .arg(format!("HEAD:{}", rel_str))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub fn file_diff_head(repo: &Path, rel: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "HEAD", "--"])
+        .arg(rel)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 pub fn detect_github_url(project_path: &Path) -> Option<String> {
     let config = std::fs::read_to_string(project_path.join(".git").join("config")).ok()?;
     extract_origin_url(&config).and_then(|raw| normalize_github_url(&raw))

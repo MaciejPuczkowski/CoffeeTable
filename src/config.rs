@@ -28,6 +28,8 @@ impl Paths {
 pub struct Settings {
     #[serde(default = "default_roots")]
     pub roots: Vec<PathBuf>,
+    #[serde(default = "default_search_excludes")]
+    pub search_excludes: Vec<String>,
 }
 
 impl Settings {
@@ -55,6 +57,7 @@ impl Settings {
     pub fn defaults() -> Self {
         Self {
             roots: default_roots(),
+            search_excludes: default_search_excludes(),
         }
     }
 }
@@ -63,5 +66,17 @@ fn default_roots() -> Vec<PathBuf> {
     vec![
         PathBuf::from("C:/Workspace/PRV"),
         PathBuf::from("C:/Workspace/SL"),
+    ]
+}
+
+fn default_search_excludes() -> Vec<String> {
+    vec![
+        "node_modules".into(),
+        ".next".into(),
+        ".git".into(),
+        ".idea".into(),
+        ".vscode".into(),
+        "bin".into(),
+        "obj".into(),
     ]
 }

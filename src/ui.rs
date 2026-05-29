@@ -3,7 +3,6 @@ use crate::{
     views::{
         changes::ChangesWidget,
         editor::{COMMANDS, EditorMode, EditorWidget, filter_commands, render_command_line},
-        file_finder::FileFinderWidget,
         file_tree::FileTreeWidget,
         grep::GrepWidget,
         project_picker::{PickerMode, ProjectPickerWidget},
@@ -36,13 +35,10 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
 
     match app.mode {
         AppMode::Picker => render_picker_overlay(app, frame, area),
-        AppMode::FileFinder => render_finder_overlay(app, frame, area),
         AppMode::Grep => render_grep_overlay(app, frame, area),
         AppMode::OpenConfirm => render_open_confirm_overlay(app, frame, area),
-        AppMode::Normal => {}
-    }
-    if editor_in_command_mode(app) {
-        render_command_palette_overlay(app, frame, area);
+        AppMode::Palette => render_command_palette_overlay(app, frame, area),
+        AppMode::Normal | AppMode::ExplorerFilter => {}
     }
     if app.leader_pending {
         render_leader_overlay(frame, area);
@@ -52,16 +48,9 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
     }
 }
 
-fn editor_in_command_mode(app: &App) -> bool {
-    matches!(
-        current_editor(app).map(|e| e.mode),
-        Some(EditorMode::Command)
-    )
-}
-
 fn render_command_palette_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let Some(editor) = current_editor(app) else { return };
-    let filtered = filter_commands(&editor.command);
+    let Some(palette) = app.palette.as_ref() else { return };
+    let filtered = filter_commands(&palette.query);
     let total_rows = filtered.len() as u16 + 6;
     let popup = centered_rect_fixed(70, total_rows.min(area.height.saturating_sub(2)).max(7), area);
     frame.render_widget(Clear, popup);
@@ -77,7 +66,7 @@ fn render_command_palette_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) 
         .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    let input = Paragraph::new(format!(":{}", editor.command))
+    let input = Paragraph::new(format!(":{}", palette.query))
         .style(
             Style::default()
                 .fg(Color::Yellow)
@@ -93,7 +82,7 @@ fn render_command_palette_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) 
     let sel = if filtered.is_empty() {
         0
     } else {
-        editor.command_selection.min(filtered.len() - 1)
+        palette.selection.min(filtered.len() - 1)
     };
     let lines: Vec<Line> = if filtered.is_empty() {
         vec![Line::from(Span::styled(
@@ -147,7 +136,9 @@ fn render_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
         ("c", "Changes ↔ tree (toggle)"),
         ("e", "Explorer (focus tree)"),
         ("b", "Buffer (focus editor)"),
-        ("w", "Toggle focus"),
+        ("w", "Show Working copy (editor)"),
+        ("h", "Show HEAD version (editor)"),
+        ("d", "Show Diff vs HEAD (editor)"),
         ("?", "Help"),
         ("q", "Quit"),
     ];
@@ -254,22 +245,34 @@ fn render_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     app.right_pane_area = chunks[1];
 
     let normal_mode = matches!(app.mode, AppMode::Normal);
+    let filter_mode = matches!(app.mode, AppMode::ExplorerFilter);
     let Some(state) = app.project_views.get_mut(&project.id) else {
         return;
     };
-    let tree_focused = normal_mode && state.focus == Focus::Tree;
+    let tree_focused = (normal_mode || filter_mode) && state.focus == Focus::Tree;
     let editor_focused = normal_mode && state.focus == Focus::Editor;
 
     let title = format!(" {} ", project.path.display());
     let selected = state.selected_path().map(|p| p.to_path_buf());
     match state.left_pane {
         LeftPaneMode::Tree => {
+            let show_filter = filter_mode || !state.tree.filter.is_empty();
+            let tree_area = if show_filter {
+                let split = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(1)])
+                    .split(chunks[0]);
+                render_filter_input(split[0], &state.tree.filter, filter_mode, frame);
+                split[1]
+            } else {
+                chunks[0]
+            };
             let tree_widget = FileTreeWidget {
                 view: &mut state.tree,
                 title,
                 focused: tree_focused,
             };
-            frame.render_widget(tree_widget, chunks[0]);
+            frame.render_widget(tree_widget, tree_area);
         }
         LeftPaneMode::Changes => {
             let project_label = project
@@ -305,6 +308,13 @@ fn render_editor_pane(
     frame: &mut Frame<'_>,
     focused: bool,
 ) {
+    let editor_path = state
+        .editor
+        .as_ref()
+        .expect("editor present")
+        .path
+        .clone();
+    let git_status = state.tree.git_status_for(&editor_path);
     let editor = state.editor.as_mut().expect("editor present");
     editor.focused = focused;
     let title = editor
@@ -315,6 +325,7 @@ fn render_editor_pane(
     let widget = EditorWidget {
         view: editor,
         area_title: title,
+        git_status,
     };
     frame.render_widget(widget, area);
 }
@@ -485,12 +496,14 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
                     .to_string()
             }
             _ => {
-                "Space menu  •  ? help  •  Tab switch project  •  Space q quit".to_string()
+                ":palette  •  Space menu  •  ? help  •  Tab switch  •  Space q quit".to_string()
             }
         },
         AppMode::Picker => "? help  •  Esc close".into(),
-        AppMode::FileFinder | AppMode::Grep => "Type to filter  •  Enter open  •  Esc cancel".into(),
+        AppMode::Grep => "Type to filter  •  Enter open  •  Esc cancel".into(),
         AppMode::OpenConfirm => "y / Enter open  •  n / Esc cancel".into(),
+        AppMode::Palette => "↑/↓ select  •  Enter run  •  ! suffix forces  •  Esc cancel".into(),
+        AppMode::ExplorerFilter => "Type to narrow  •  ↑/↓ select  •  Enter open  •  Esc clear+exit".into(),
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -516,12 +529,26 @@ fn render_picker_overlay(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
-fn render_finder_overlay(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered_rect(70, 70, area);
-    frame.render_widget(Clear, popup);
-    if let Some(finder) = app.file_finder.as_mut() {
-        frame.render_widget(FileFinderWidget { finder }, popup);
-    }
+fn render_filter_input(area: Rect, query: &str, focused: bool, frame: &mut Frame<'_>) {
+    let border_style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let title = if focused {
+        " filter (type to narrow • Enter open • Esc clear) "
+    } else {
+        " filter "
+    };
+    let para = Paragraph::new(format!("/{}", query))
+        .style(Style::default().fg(Color::Yellow))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(title),
+        );
+    frame.render_widget(para, area);
 }
 
 fn render_open_confirm_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -637,7 +664,7 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                         ("d", "delete selected (saved only)"),
                         ("Esc", "close picker"),
                         ("?", "toggle this help"),
-                        ("Ctrl+C", "quit app"),
+                        ("Ctrl+C", "copy selection / current line / selected path"),
                     ],
                 ),
                 Some(PickerMode::Roots) => (
@@ -648,7 +675,7 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                         ("d", "delete selected root"),
                         ("Esc", "back to projects (rescans)"),
                         ("?", "toggle this help"),
-                        ("Ctrl+C", "quit app"),
+                        ("Ctrl+C", "copy selection / current line / selected path"),
                     ],
                 ),
                 _ => (
@@ -662,13 +689,14 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                 ),
             }
         }
-        AppMode::FileFinder => (
-            "Find file",
+        AppMode::ExplorerFilter => (
+            "Explorer filter",
             vec![
-                ("(text)", "fuzzy filter"),
-                ("↑/↓", "navigate results"),
-                ("Enter", "open in editor"),
-                ("Esc", "cancel"),
+                ("(text)", "narrow visible tree"),
+                ("↑/↓", "navigate matches"),
+                ("Enter", "open selected file"),
+                ("Backspace", "delete a character (empty → exit)"),
+                ("Esc", "clear filter and exit"),
             ],
         ),
         AppMode::Grep => (
@@ -687,6 +715,16 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                 ("n / Esc", "cancel"),
             ],
         ),
+        AppMode::Palette => (
+            "Command palette",
+            vec![
+                ("(text)", "filter commands"),
+                ("↑/↓  Tab/BackTab", "navigate"),
+                ("Enter", "run highlighted command (or literal if none)"),
+                ("! suffix", "force (q!, e!, Q!)"),
+                ("Esc", "cancel"),
+            ],
+        ),
         AppMode::Normal => {
             let focus = current_focus(app).unwrap_or(Focus::Tree);
             match focus {
@@ -699,10 +737,12 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                         ("e", "open selected file and focus editor"),
                         ("g / G", "jump to top / bottom"),
                         ("Tab / Shift+Tab", "next / previous project"),
+                        (":", "open command palette (works globally)"),
                         ("Space c", "toggle Changes view ↔ Tree view"),
                         ("Space p / f / g", "projects / find file / grep"),
                         ("Space e / b / w", "focus tree / editor / toggle"),
-                        ("Space q  /  Ctrl+C", "quit"),
+                        ("Space q", "quit"),
+                        ("Ctrl+C", "copy selected path to clipboard"),
                         ("?", "toggle this help"),
                         ("colors", "red untracked • yellow modified • green staged"),
                     ],
@@ -724,12 +764,18 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                         ("u / Ctrl+R", "undo / redo"),
                         ("/pattern  n / N", "search forward, next / prev"),
                         (":", "open command palette (dropdown)"),
+                        (":S  /  :settings", "open settings.yaml (autoreloads on save)"),
+                        ("Space h  /  :H", "show HEAD version of file (read-only)"),
+                        ("Space d  /  :D", "show unified diff against HEAD (read-only)"),
+                        ("Space w  /  :W", "back to working copy (editable)"),
+                        ("click pill", "switch view by clicking on the title pills"),
                         ("Backspace", "focus the explorer (file stays open)"),
                         ("Esc (from Insert)", "back to normal — autosaves file"),
                         ("Space (normal/visual)", "leader menu"),
                         ("Space p / f / g", "projects / find file / grep"),
                         ("Space e / b / w", "focus tree / editor / toggle"),
-                        ("Space q  /  Ctrl+C", "quit app"),
+                        ("Space q", "quit app"),
+                        ("Ctrl+C", "copy selection or current line"),
                         ("?", "toggle this help"),
                     ],
                 ),

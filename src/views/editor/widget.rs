@@ -1,23 +1,34 @@
 use super::EditorView;
-use super::types::EditorMode;
+use super::types::{EditorMode, GitView};
+use crate::git::GitStatus;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Widget},
 };
 
 const SELECTION_BG: Color = Color::Rgb(33, 66, 131);
+const DIFF_ADDED_BG: Color = Color::Rgb(20, 55, 25);
+const DIFF_REMOVED_BG: Color = Color::Rgb(70, 25, 25);
+const DIFF_HUNK_BG: Color = Color::Rgb(45, 45, 90);
 
 pub struct EditorWidget<'a> {
     pub view: &'a mut EditorView,
     pub area_title: String,
+    pub git_status: Option<GitStatus>,
 }
 
 impl<'a> Widget for EditorWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.view.last_render_area = Some(area);
-        let inner = render_block(&self.view, &self.area_title, area, buf);
+        let (title_line, pills) =
+            build_title_with_pills(self.view, &self.area_title, self.git_status, area);
+        self.view.pill_working = pills[0];
+        self.view.pill_head = pills[1];
+        self.view.pill_diff = pills[2];
+        let inner = render_block_with_title(self.view, title_line, area, buf);
         self.view.viewport_rows = inner.height;
         self.view.ensure_cursor_visible();
 
@@ -41,21 +52,113 @@ impl<'a> Widget for EditorWidget<'a> {
     }
 }
 
-fn render_block(view: &EditorView, title: &str, area: Rect, buf: &mut Buffer) -> Rect {
+fn render_block_with_title(
+    view: &EditorView,
+    title_line: Line<'static>,
+    area: Rect,
+    buf: &mut Buffer,
+) -> Rect {
     let border_style = if view.focused {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let modified = if view.modified { " [+]" } else { "" };
-    let title = format!(" {}{} ", title, modified);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(title);
+        .title(title_line);
     let inner = block.inner(area);
     block.render(area, buf);
     inner
+}
+
+fn build_title_with_pills(
+    view: &EditorView,
+    title: &str,
+    git_status: Option<GitStatus>,
+    area: Rect,
+) -> (Line<'static>, [Option<Rect>; 3]) {
+    let mut tracker = TitleTracker::new(area.x + 1, area.y);
+    tracker.push(Span::raw(" "));
+    tracker.push(Span::styled(
+        title.to_string(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    if view.modified && matches!(view.git_view, GitView::Working) {
+        tracker.push(Span::styled(
+            " [+]".to_string(),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let pills = append_status_badge(&mut tracker, view, git_status);
+    tracker.push(Span::raw(" "));
+    (Line::from(tracker.spans), pills)
+}
+
+struct TitleTracker {
+    spans: Vec<Span<'static>>,
+    x: u16,
+    y: u16,
+}
+
+impl TitleTracker {
+    fn new(x: u16, y: u16) -> Self {
+        Self { spans: Vec::new(), x, y }
+    }
+
+    fn push(&mut self, span: Span<'static>) {
+        self.x += span.content.chars().count() as u16;
+        self.spans.push(span);
+    }
+
+    fn record(&mut self, span: Span<'static>) -> Rect {
+        let w = span.content.chars().count() as u16;
+        let rect = Rect::new(self.x, self.y, w, 1);
+        self.x += w;
+        self.spans.push(span);
+        rect
+    }
+}
+
+fn append_status_badge(
+    tracker: &mut TitleTracker,
+    view: &EditorView,
+    git_status: Option<GitStatus>,
+) -> [Option<Rect>; 3] {
+    let in_alt_view = !matches!(view.git_view, GitView::Working);
+    if !in_alt_view && matches!(git_status, Some(GitStatus::Untracked)) {
+        tracker.push(Span::raw("   "));
+        tracker.push(Span::styled(
+            " untracked ".to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        return [None; 3];
+    }
+    let show_pills = in_alt_view
+        || matches!(git_status, Some(GitStatus::Modified | GitStatus::Staged));
+    if !show_pills {
+        return [None; 3];
+    }
+    tracker.push(Span::raw("   "));
+    let working_rect = tracker.record(view_pill('w', "Working", matches!(view.git_view, GitView::Working)));
+    let head_rect = tracker.record(view_pill('h', "HEAD", matches!(view.git_view, GitView::Head)));
+    let diff_rect = tracker.record(view_pill('d', "Diff", matches!(view.git_view, GitView::Diff)));
+    [Some(working_rect), Some(head_rect), Some(diff_rect)]
+}
+
+fn view_pill(letter: char, label: &str, active: bool) -> Span<'static> {
+    let text = format!(" {}·{} ", letter, label);
+    if active {
+        Span::styled(
+            text,
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(text, Style::default().fg(Color::DarkGray))
+    }
 }
 
 struct BodyLayout {
@@ -155,6 +258,10 @@ fn paint_line(
     selection: &SelectionFrame,
 ) {
     let scroll_col = view.scroll_col;
+    let row_bg = diff_row_bg(view, row_idx);
+    if let Some(bg) = row_bg {
+        paint_row_background(buf, layout, cell_y, bg);
+    }
     let mut char_idx = 0usize;
     if let Some(spans) = spans {
         'spans: for (style, text) in spans {
@@ -165,7 +272,7 @@ fn paint_line(
                         break 'spans;
                     }
                     let cell_style =
-                        style_for_cell(view, *style, row_idx, char_idx, selection);
+                        style_for_cell(view, *style, row_idx, char_idx, selection, row_bg);
                     buf[(layout.body_x + disp_x as u16, cell_y)]
                         .set_char(ch)
                         .set_style(cell_style);
@@ -180,14 +287,40 @@ fn paint_line(
     }
 }
 
+fn diff_row_bg(view: &EditorView, row_idx: usize) -> Option<Color> {
+    if !matches!(view.git_view, GitView::Diff) {
+        return None;
+    }
+    let line = view.lines.get(row_idx)?;
+    let first = line.first().copied()?;
+    match first {
+        '+' => Some(DIFF_ADDED_BG),
+        '-' => Some(DIFF_REMOVED_BG),
+        '─' | '@' => Some(DIFF_HUNK_BG),
+        _ => None,
+    }
+}
+
+fn paint_row_background(buf: &mut Buffer, layout: &BodyLayout, cell_y: u16, bg: Color) {
+    let style = Style::default().bg(bg);
+    for dx in 0..layout.body_w {
+        let x = layout.body_x + dx as u16;
+        buf[(x, cell_y)].set_char(' ').set_style(style);
+    }
+}
+
 fn style_for_cell(
     view: &EditorView,
     base: Style,
     row: usize,
     col: usize,
     selection: &SelectionFrame,
+    row_bg: Option<Color>,
 ) -> Style {
     let mut style = base;
+    if let Some(bg) = row_bg {
+        style = style.bg(bg);
+    }
     if selection.contains(row, col) {
         style = style.bg(SELECTION_BG);
     }
@@ -276,13 +409,12 @@ fn in_selection(
 }
 
 pub fn render_command_line(area: Rect, buf: &mut Buffer, view: &EditorView) {
-    let (prefix, text) = match view.mode {
-        EditorMode::Command => (":", view.command.as_str()),
-        EditorMode::Search => ("/", view.search.as_str()),
-        _ => ("", ""),
+    let text = match view.mode {
+        EditorMode::Search => view.search.as_str(),
+        _ => return,
     };
     let style = Style::default().fg(Color::Yellow);
-    let line = format!("{}{}", prefix, text);
+    let line = format!("/{}", text);
     for (i, ch) in line.chars().enumerate() {
         if (i as u16) >= area.width {
             break;

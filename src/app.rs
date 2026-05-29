@@ -5,8 +5,7 @@ use crate::{
     project::Project,
     views::{
         changes::ChangesView,
-        editor::{EditorMode, EditorRequest, EditorView},
-        file_finder::FileFinder,
+        editor::{COMMANDS, EditorMode, EditorView, GitView, filter_commands},
         file_tree::{Action as FileTreeAction, FileTreeView},
         grep::GrepView,
         project_picker::{PickerItem, PickerMode, ProjectPicker},
@@ -23,9 +22,16 @@ use std::{
 pub enum AppMode {
     Normal,
     Picker,
-    FileFinder,
     Grep,
     OpenConfirm,
+    Palette,
+    ExplorerFilter,
+}
+
+#[derive(Default)]
+pub struct PaletteState {
+    pub query: String,
+    pub selection: usize,
 }
 
 pub struct PendingOpen {
@@ -72,13 +78,14 @@ pub struct App {
     pub db: Db,
     pub settings_path: PathBuf,
     pub roots: Vec<PathBuf>,
+    pub search_excludes: Vec<String>,
     pub open_projects: Vec<Project>,
     pub active_index: usize,
     pub project_views: HashMap<i64, ProjectViewState>,
     pub mode: AppMode,
     pub picker: Option<ProjectPicker>,
-    pub file_finder: Option<FileFinder>,
     pub grep: Option<GrepView>,
+    pub palette: Option<PaletteState>,
     pub pending_open: Option<PendingOpen>,
     pub should_quit: bool,
     pub status: String,
@@ -94,6 +101,7 @@ impl App {
     pub fn new(db: Db, settings_path: PathBuf) -> Result<Self> {
         let settings = Settings::load_or_seed(&settings_path)?;
         let roots = settings.roots;
+        let search_excludes = settings.search_excludes;
         let (open_ids, active_id) = db.load_open_projects()?;
         let all = db.list_projects()?;
         let open_projects: Vec<Project> = open_ids
@@ -139,13 +147,14 @@ impl App {
             db,
             settings_path,
             roots,
+            search_excludes,
             open_projects,
             active_index,
             project_views,
             mode,
             picker,
-            file_finder: None,
             grep: None,
+            palette: None,
             pending_open: None,
             should_quit: false,
             status: String::new(),
@@ -187,7 +196,7 @@ impl App {
             return Ok(());
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.should_quit = true;
+            self.copy_current_context();
             return Ok(());
         }
         if key.code == KeyCode::Char(' ')
@@ -197,14 +206,272 @@ impl App {
             self.leader_pending = true;
             return Ok(());
         }
+        if key.code == KeyCode::Char(':')
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.should_open_palette()
+        {
+            self.open_palette();
+            return Ok(());
+        }
         match self.mode {
             AppMode::Picker => self.on_key_picker(key)?,
-            AppMode::FileFinder => self.on_key_file_finder(key)?,
             AppMode::Grep => self.on_key_grep(key)?,
             AppMode::OpenConfirm => self.on_key_open_confirm(key)?,
+            AppMode::Palette => self.on_key_palette(key)?,
+            AppMode::ExplorerFilter => self.on_key_explorer_filter(key)?,
             AppMode::Normal => self.on_key_normal(key)?,
         }
         Ok(())
+    }
+
+    fn should_open_palette(&self) -> bool {
+        if !matches!(self.mode, AppMode::Normal) {
+            return false;
+        }
+        let Some(state) = self.active_state_ref() else {
+            return true;
+        };
+        match state.focus {
+            Focus::Tree => true,
+            Focus::Editor => match state.editor.as_ref().map(|e| e.mode) {
+                Some(EditorMode::Insert | EditorMode::Search) => false,
+                _ => true,
+            },
+        }
+    }
+
+    fn open_palette(&mut self) {
+        self.palette = Some(PaletteState::default());
+        self.mode = AppMode::Palette;
+    }
+
+    fn close_palette(&mut self) {
+        self.palette = None;
+        self.mode = AppMode::Normal;
+    }
+
+    fn on_key_palette(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(palette) = self.palette.as_mut() else {
+            return Ok(());
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_palette(),
+            (KeyCode::Enter, _) => self.run_palette_enter()?,
+            (KeyCode::Backspace, _) => {
+                if palette.query.pop().is_none() {
+                    self.close_palette();
+                }
+                if let Some(p) = self.palette.as_mut() {
+                    p.selection = 0;
+                }
+            }
+            (KeyCode::Down, _) | (KeyCode::Tab, _) => {
+                let filtered = filter_commands(&palette.query);
+                if !filtered.is_empty() {
+                    palette.selection = (palette.selection + 1).min(filtered.len() - 1);
+                }
+            }
+            (KeyCode::Up, _) | (KeyCode::BackTab, _) => {
+                palette.selection = palette.selection.saturating_sub(1);
+            }
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                palette.query.push(c);
+                palette.selection = 0;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn run_palette_enter(&mut self) -> Result<()> {
+        let (raw, selection) = {
+            let palette = self.palette.as_ref().expect("palette present");
+            (palette.query.trim().to_string(), palette.selection)
+        };
+        let force = raw.ends_with('!');
+        let filtered = filter_commands(&raw);
+        let to_run = match filtered
+            .get(selection.min(filtered.len().saturating_sub(1)))
+            .copied()
+        {
+            Some(idx) => {
+                let key = COMMANDS[idx].key.to_string();
+                if force { format!("{}!", key) } else { key }
+            }
+            None => raw,
+        };
+        self.close_palette();
+        self.run_palette_command(&to_run)?;
+        Ok(())
+    }
+
+    fn run_palette_command(&mut self, cmd: &str) -> Result<()> {
+        let (base, force) = match cmd.strip_suffix('!') {
+            Some(rest) => (rest, true),
+            None => (cmd, false),
+        };
+        match base {
+            "w" | "write" => self.palette_save(),
+            "q" | "close" => self.palette_close_editor(force),
+            "wq" | "x" => self.palette_save_and_close(),
+            "Q" | "qa" | "quit" => self.palette_quit_app(force),
+            "e" | "edit" | "reload" => self.palette_reload(force),
+            "f" | "find" => self.open_explorer_filter(),
+            "g" | "grep" => self.open_grep(),
+            "p" | "projects" => self.open_picker()?,
+            "t" | "tree" | "explorer" => self.focus_tree(),
+            "b" | "buffer" => self.focus_editor(),
+            "h" | "help" => self.help_visible = true,
+            "S" | "settings" | "config" => self.open_settings_in_editor()?,
+            "H" | "head" | "old" => self.palette_show_head(),
+            "W" | "working" | "work" | "new" => self.palette_show_working(),
+            "D" | "diff" => self.palette_show_diff(),
+            "" => {}
+            other => self.status = format!("Not a command: {}", other),
+        }
+        Ok(())
+    }
+
+    fn palette_save(&mut self) {
+        let Some(state) = self.active_state() else {
+            self.status = "No editor open".into();
+            return;
+        };
+        let Some(editor) = state.editor.as_mut() else {
+            self.status = "No editor open".into();
+            return;
+        };
+        let path = editor.path.clone();
+        if let Err(e) = editor.save() {
+            self.status = format!("Save error: {}", e);
+            return;
+        }
+        if path == self.settings_path {
+            self.reload_settings_from_disk();
+        } else {
+            let _ = self.refresh_git_status();
+        }
+    }
+
+    fn palette_close_editor(&mut self, force: bool) {
+        let Some(state) = self.active_state() else {
+            self.status = "No editor open".into();
+            return;
+        };
+        let Some(editor) = state.editor.as_mut() else {
+            self.status = "No editor open".into();
+            return;
+        };
+        if !editor.modified || force {
+            state.editor = None;
+            state.focus = Focus::Tree;
+        } else {
+            self.status = "No write since last change (q! to force)".into();
+        }
+    }
+
+    fn palette_save_and_close(&mut self) {
+        self.palette_save();
+        if self.status.starts_with("Save error") {
+            return;
+        }
+        if let Some(state) = self.active_state() {
+            state.editor = None;
+            state.focus = Focus::Tree;
+        }
+    }
+
+    fn palette_quit_app(&mut self, force: bool) {
+        let modified = self
+            .active_state_ref()
+            .and_then(|s| s.editor.as_ref())
+            .map(|e| e.modified)
+            .unwrap_or(false);
+        if !modified || force {
+            self.should_quit = true;
+        } else {
+            self.status = "No write since last change (Q! to force)".into();
+        }
+    }
+
+    fn palette_show_head(&mut self) {
+        let Some((project_path, file_path)) = self.editor_file_in_project() else {
+            return;
+        };
+        let Ok(rel) = file_path.strip_prefix(&project_path) else {
+            self.status = "File is outside the active project".into();
+            return;
+        };
+        match git::show_head(&project_path, rel) {
+            Some(content) => self.apply_alt_view(GitView::Head, content),
+            None => self.status = "Could not read HEAD version (file untracked?)".into(),
+        }
+    }
+
+    fn palette_show_diff(&mut self) {
+        let Some((project_path, file_path)) = self.editor_file_in_project() else {
+            return;
+        };
+        let Ok(rel) = file_path.strip_prefix(&project_path) else {
+            self.status = "File is outside the active project".into();
+            return;
+        };
+        match git::file_diff_head(&project_path, rel) {
+            Some(content) if !content.is_empty() => {
+                self.apply_alt_view(GitView::Diff, prettify_diff(&content))
+            }
+            Some(_) => self.status = "No changes against HEAD".into(),
+            None => self.status = "Could not produce diff".into(),
+        }
+    }
+
+    fn palette_show_working(&mut self) {
+        let Some(state) = self.active_state() else {
+            self.status = "No editor open".into();
+            return;
+        };
+        let Some(editor) = state.editor.as_mut() else {
+            self.status = "No editor open".into();
+            return;
+        };
+        editor.show_working();
+    }
+
+    fn editor_file_in_project(&mut self) -> Option<(PathBuf, PathBuf)> {
+        let project_path = self.active_project()?.path.clone();
+        let file_path = self
+            .active_state_ref()
+            .and_then(|s| s.editor.as_ref())
+            .map(|e| e.path.clone());
+        match file_path {
+            Some(p) => Some((project_path, p)),
+            None => {
+                self.status = "No editor open".into();
+                None
+            }
+        }
+    }
+
+    fn apply_alt_view(&mut self, view: GitView, content: String) {
+        if let Some(editor) = self.active_state().and_then(|s| s.editor.as_mut()) {
+            editor.show_alt_view(view, content);
+        }
+    }
+
+    fn palette_reload(&mut self, force: bool) {
+        let Some(state) = self.active_state() else {
+            self.status = "No editor open".into();
+            return;
+        };
+        let Some(editor) = state.editor.as_mut() else {
+            self.status = "No editor open".into();
+            return;
+        };
+        editor.reload(force);
+        let s = std::mem::take(&mut editor.status);
+        if !s.is_empty() {
+            self.status = s;
+        }
     }
 
     fn should_activate_leader(&self) -> bool {
@@ -217,11 +484,41 @@ impl App {
         match state.focus {
             Focus::Tree => true,
             Focus::Editor => match state.editor.as_ref().map(|e| e.mode) {
-                Some(EditorMode::Insert)
-                | Some(EditorMode::Command)
-                | Some(EditorMode::Search) => false,
+                Some(EditorMode::Insert) | Some(EditorMode::Search) => false,
                 _ => true,
             },
+        }
+    }
+
+    fn copy_current_context(&mut self) {
+        if !matches!(self.mode, AppMode::Normal) {
+            return;
+        }
+        let focus = self.active_state_ref().map(|s| s.focus);
+        match focus {
+            Some(Focus::Editor) => self.copy_from_editor(),
+            Some(Focus::Tree) => self.copy_selected_path(),
+            None => {}
+        }
+    }
+
+    fn copy_from_editor(&mut self) {
+        let Some(state) = self.active_state() else { return };
+        let Some(editor) = state.editor.as_mut() else { return };
+        editor.copy_current();
+        let status = std::mem::take(&mut editor.status);
+        if !status.is_empty() {
+            self.status = status;
+        }
+    }
+
+    fn copy_selected_path(&mut self) {
+        let path = self
+            .active_state_ref()
+            .and_then(|s| s.selected_path().map(|p| p.to_path_buf()));
+        if let Some(p) = path {
+            crate::clipboard::copy(&p.to_string_lossy());
+            self.status = format!("Copied path: {}", p.display());
         }
     }
 
@@ -229,13 +526,15 @@ impl App {
         match key.code {
             KeyCode::Esc => {}
             KeyCode::Char('p') => self.open_picker()?,
-            KeyCode::Char('f') => self.open_file_finder(),
+            KeyCode::Char('f') => self.open_explorer_filter(),
             KeyCode::Char('g') => self.open_grep(),
-            KeyCode::Char('w') => self.toggle_focus(),
             KeyCode::Char('e') => self.focus_tree(),
             KeyCode::Char('b') => self.focus_editor(),
             KeyCode::Char('c') => self.toggle_left_pane(),
-            KeyCode::Char('?') | KeyCode::Char('h') => self.help_visible = true,
+            KeyCode::Char('w') => self.palette_show_working(),
+            KeyCode::Char('h') => self.palette_show_head(),
+            KeyCode::Char('d') => self.palette_show_diff(),
+            KeyCode::Char('?') => self.help_visible = true,
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char(' ') => {}
             _ => {
@@ -266,6 +565,7 @@ impl App {
     fn save_settings(&self) -> Result<()> {
         let s = Settings {
             roots: self.roots.clone(),
+            search_excludes: self.search_excludes.clone(),
         };
         s.save(&self.settings_path)
     }
@@ -408,6 +708,33 @@ impl App {
     }
 
     fn click_right_pane(&mut self, col: u16, row: u16) {
+        let pill_hit = self
+            .active_state_ref()
+            .and_then(|s| s.editor.as_ref())
+            .and_then(|e| {
+                if e.pill_working.map(|r| contains(r, col, row)).unwrap_or(false) {
+                    return Some(0);
+                }
+                if e.pill_head.map(|r| contains(r, col, row)).unwrap_or(false) {
+                    return Some(1);
+                }
+                if e.pill_diff.map(|r| contains(r, col, row)).unwrap_or(false) {
+                    return Some(2);
+                }
+                None
+            });
+        if let Some(idx) = pill_hit {
+            if let Some(s) = self.active_state() {
+                s.focus = Focus::Editor;
+            }
+            match idx {
+                0 => self.palette_show_working(),
+                1 => self.palette_show_head(),
+                2 => self.palette_show_diff(),
+                _ => {}
+            }
+            return;
+        }
         if let Some(s) = self.active_state() {
             if let Some(editor) = s.editor.as_mut() {
                 s.focus = Focus::Editor;
@@ -464,15 +791,14 @@ impl App {
                 }
                 true
             }
-            AppMode::FileFinder | AppMode::Grep | AppMode::OpenConfirm => false,
+            AppMode::Grep | AppMode::OpenConfirm | AppMode::Palette | AppMode::ExplorerFilter => false,
             AppMode::Normal => {
                 if let Some(state) = self.active_state_ref() {
                     if state.focus == Focus::Editor {
                         if let Some(e) = &state.editor {
-                            if !matches!(e.mode, EditorMode::Normal | EditorMode::Visual | EditorMode::VisualLine) {
+                            if matches!(e.mode, EditorMode::Insert | EditorMode::Search) {
                                 return false;
                             }
-                            return false;
                         }
                     }
                 }
@@ -623,37 +949,42 @@ impl App {
             return Ok(());
         };
         editor.handle_key(key);
-        let close = editor.close_requested;
-        let quit = editor.quit_app_requested;
-        let request = editor.pending_request.take();
         let did_save = std::mem::replace(&mut editor.did_save, false);
+        let request_focus_tree = std::mem::replace(&mut editor.request_focus_tree, false);
+        let saved_path = if did_save { Some(editor.path.clone()) } else { None };
         let status = std::mem::take(&mut editor.status);
         if !status.is_empty() {
             self.status = status;
         }
-        if did_save {
-            let _ = self.refresh_git_status();
-        }
-        if close {
-            if let Some(s) = self.active_state() {
-                s.editor = None;
-                s.focus = Focus::Tree;
+        if let Some(path) = saved_path {
+            if path == self.settings_path {
+                self.reload_settings_from_disk();
+            } else {
+                let _ = self.refresh_git_status();
             }
         }
-        if quit {
-            self.should_quit = true;
-        }
-        if let Some(req) = request {
-            match req {
-                EditorRequest::OpenFinder => self.open_file_finder(),
-                EditorRequest::OpenGrep => self.open_grep(),
-                EditorRequest::OpenPicker => self.open_picker()?,
-                EditorRequest::FocusTree => self.focus_tree(),
-                EditorRequest::FocusEditor => self.focus_editor(),
-                EditorRequest::ShowHelp => self.help_visible = true,
-            }
+        if request_focus_tree {
+            self.focus_tree();
         }
         Ok(())
+    }
+
+    fn open_settings_in_editor(&mut self) -> Result<()> {
+        let path = self.settings_path.clone();
+        self.open_file_in_editor(path)
+    }
+
+    fn reload_settings_from_disk(&mut self) {
+        match Settings::load_or_seed(&self.settings_path) {
+            Ok(s) => {
+                self.roots = s.roots;
+                self.search_excludes = s.search_excludes;
+                self.status = "Settings reloaded".into();
+            }
+            Err(e) => {
+                self.status = format!("Settings reload failed: {}", e);
+            }
+        }
     }
 
     fn open_file_in_editor(&mut self, path: PathBuf) -> Result<()> {
@@ -744,20 +1075,6 @@ impl App {
         }
     }
 
-    fn toggle_focus(&mut self) {
-        if let Some(state) = self.active_state() {
-            state.focus = match state.focus {
-                Focus::Tree => {
-                    if state.editor.is_some() {
-                        Focus::Editor
-                    } else {
-                        Focus::Tree
-                    }
-                }
-                Focus::Editor => Focus::Tree,
-            };
-        }
-    }
 
     fn on_key_picker(&mut self, key: KeyEvent) -> Result<()> {
         let Some(mode) = self.picker.as_ref().map(|p| p.mode) else {
@@ -962,38 +1279,40 @@ impl App {
         Ok(())
     }
 
-    fn on_key_file_finder(&mut self, key: KeyEvent) -> Result<()> {
-        let mut consumed = true;
-        {
-            let Some(finder) = self.file_finder.as_mut() else {
-                return Ok(());
-            };
-            match (key.code, key.modifiers) {
-                (KeyCode::Down, _) => finder.move_down(),
-                (KeyCode::Up, _) => finder.move_up(),
-                (KeyCode::Backspace, _) => finder.pop_char(),
-                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => finder.push_char(c),
-                _ => consumed = false,
-            }
-        }
-        if consumed {
+    fn on_key_explorer_filter(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(state) = self.active_state() else {
+            self.mode = AppMode::Normal;
             return Ok(());
-        }
+        };
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => {
-                self.file_finder = None;
+                state.tree.clear_filter();
                 self.mode = AppMode::Normal;
             }
             (KeyCode::Enter, _) => {
-                let path = self
-                    .file_finder
-                    .as_ref()
-                    .and_then(|f| f.selected_path().map(|p| p.to_path_buf()));
+                let path = state.tree.selected_path().map(|p| p.to_path_buf());
+                self.mode = AppMode::Normal;
                 if let Some(p) = path {
-                    self.file_finder = None;
-                    self.mode = AppMode::Normal;
-                    self.open_file_in_editor(p)?;
+                    if p.is_file() {
+                        self.open_file_in_editor(p)?;
+                    }
                 }
+            }
+            (KeyCode::Backspace, _) => {
+                let mut q = state.tree.filter.clone();
+                if q.pop().is_some() {
+                    state.tree.set_filter(q);
+                } else {
+                    state.tree.clear_filter();
+                    self.mode = AppMode::Normal;
+                }
+            }
+            (KeyCode::Up, _) => state.tree.move_up(),
+            (KeyCode::Down, _) => state.tree.move_down(),
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                let mut q = state.tree.filter.clone();
+                q.push(c);
+                state.tree.set_filter(q);
             }
             _ => {}
         }
@@ -1086,16 +1405,21 @@ impl App {
         Ok(())
     }
 
-    fn open_file_finder(&mut self) {
-        if let Some(p) = self.active_project().cloned() {
-            self.file_finder = Some(FileFinder::new(p.path));
-            self.mode = AppMode::FileFinder;
+    fn open_explorer_filter(&mut self) {
+        if self.active_state().is_none() {
+            return;
         }
+        if let Some(state) = self.active_state() {
+            state.left_pane = LeftPaneMode::Tree;
+            state.focus = Focus::Tree;
+            state.tree.set_filter(String::new());
+        }
+        self.mode = AppMode::ExplorerFilter;
     }
 
     fn open_grep(&mut self) {
         if let Some(p) = self.active_project().cloned() {
-            self.grep = Some(GrepView::new(p.path));
+            self.grep = Some(GrepView::new(p.path, self.search_excludes.clone()));
             self.mode = AppMode::Grep;
         }
     }
@@ -1151,6 +1475,65 @@ enum BrowseEnter {
     OpenSaved(Project),
     AddDiscovered { name: String, path: PathBuf },
     None,
+}
+
+fn prettify_diff(raw: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut header_done = false;
+    for line in raw.lines() {
+        if !header_done {
+            if line.starts_with("@@") {
+                header_done = true;
+            } else {
+                continue;
+            }
+        }
+        if let Some(formatted) = format_hunk_header(line) {
+            if !out.is_empty() {
+                out.push(String::new());
+            }
+            out.push(formatted);
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
+fn format_hunk_header(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("@@")?;
+    let (range, context) = rest.split_once("@@")?;
+    let parts: Vec<&str> = range.trim().split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let old = parts[0].trim_start_matches('-');
+    let new = parts[1].trim_start_matches('+');
+    let old_label = format_range(old, '-');
+    let new_label = format_range(new, '+');
+    let mut header = format!("─── {}  →  {} ───", old_label, new_label);
+    let context = context.trim();
+    if !context.is_empty() {
+        header.push_str("   ");
+        header.push_str(context);
+    }
+    Some(header)
+}
+
+fn format_range(part: &str, sign: char) -> String {
+    let (start, count) = match part.split_once(',') {
+        Some((s, c)) => (s, c.parse::<usize>().unwrap_or(0)),
+        None => (part, 1),
+    };
+    let start_n = start.parse::<usize>().unwrap_or(0);
+    if count == 0 {
+        format!("{} line {}", sign, start_n)
+    } else if count == 1 {
+        format!("{} L{}", sign, start_n)
+    } else {
+        let end = start_n + count.saturating_sub(1);
+        format!("{} L{}-{}", sign, start_n, end)
+    }
 }
 
 fn contains(rect: Rect, col: u16, row: u16) -> bool {

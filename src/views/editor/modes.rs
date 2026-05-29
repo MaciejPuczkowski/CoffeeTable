@@ -1,5 +1,5 @@
 use super::EditorView;
-use super::types::{COMMANDS, EditorMode, EditorRequest, filter_commands};
+use super::types::EditorMode;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 impl EditorView {
@@ -10,7 +10,7 @@ impl EditorView {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => {}
             (KeyCode::Backspace, _) => {
-                self.pending_request = Some(EditorRequest::FocusTree);
+                self.request_focus_tree = true;
             }
             (KeyCode::Char('h'), _) | (KeyCode::Left, _) => self.move_left(),
             (KeyCode::Char('l'), _) | (KeyCode::Right, _) => self.move_right(),
@@ -66,7 +66,6 @@ impl EditorView {
                 self.repeat_search(true)
             }
             (KeyCode::Char('N'), _) => self.repeat_search(false),
-            (KeyCode::Char(':'), _) => self.enter_command(),
             (KeyCode::Enter, _) => self.jump_next_line_indent(),
             _ => {}
         }
@@ -91,7 +90,10 @@ impl EditorView {
     pub(super) fn visual_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.leave_visual(),
-            (KeyCode::Backspace, _) => self.leave_visual_to_tree(),
+            (KeyCode::Backspace, _) => {
+                self.request_focus_tree = true;
+                self.leave_visual();
+            }
             (KeyCode::Char('v'), _) => self.toggle_visual(EditorMode::Visual),
             (KeyCode::Char('V'), _) => self.toggle_visual(EditorMode::VisualLine),
             (KeyCode::Char('h'), _) | (KeyCode::Left, _) => self.move_left(),
@@ -111,19 +113,28 @@ impl EditorView {
         }
     }
 
-    pub(super) fn command_key(&mut self, key: KeyEvent) {
+    pub(super) fn readonly_key(&mut self, key: KeyEvent) {
+        if self.mode == EditorMode::Search {
+            self.search_key(key);
+            return;
+        }
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => self.cancel_command(),
-            (KeyCode::Enter, _) => self.run_command_from_palette(),
-            (KeyCode::Backspace, _) => self.command_backspace(),
-            (KeyCode::Down, _) | (KeyCode::Tab, _) => self.command_select_down(),
-            (KeyCode::Up, _) | (KeyCode::BackTab, _) => {
-                self.command_selection = self.command_selection.saturating_sub(1);
-            }
-            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
-                self.command.push(c);
-                self.command_selection = 0;
-            }
+            (KeyCode::Esc, _) => {}
+            (KeyCode::Backspace, _) => self.request_focus_tree = true,
+            (KeyCode::Char('h'), _) | (KeyCode::Left, _) => self.move_left(),
+            (KeyCode::Char('l'), _) | (KeyCode::Right, _) => self.move_right(),
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.move_down(),
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.move_up(),
+            (KeyCode::Char('0'), _) | (KeyCode::Home, _) => self.jump_line_start(),
+            (KeyCode::Char('^'), _) => self.jump_first_non_ws(),
+            (KeyCode::Char('$'), _) | (KeyCode::End, _) => self.jump_line_end(),
+            (KeyCode::Char('w'), _) => self.motion_word_forward(),
+            (KeyCode::Char('b'), _) => self.motion_word_back(),
+            (KeyCode::Char('G'), _) => self.jump_last_line(),
+            (KeyCode::Char('g'), _) => self.visual_gg(),
+            (KeyCode::Char('/'), _) => self.enter_search(),
+            (KeyCode::Char('n'), _) => self.repeat_search(true),
+            (KeyCode::Char('N'), _) => self.repeat_search(false),
             _ => {}
         }
     }
@@ -191,12 +202,6 @@ impl EditorView {
         self.search.clear();
     }
 
-    fn enter_command(&mut self) {
-        self.mode = EditorMode::Command;
-        self.command.clear();
-        self.command_selection = 0;
-    }
-
     fn leave_insert(&mut self) {
         self.mode = EditorMode::Normal;
         if self.cursor.1 > 0 {
@@ -222,12 +227,6 @@ impl EditorView {
         self.anchor = None;
     }
 
-    fn leave_visual_to_tree(&mut self) {
-        self.pending_request = Some(EditorRequest::FocusTree);
-        self.mode = EditorMode::Normal;
-        self.anchor = None;
-    }
-
     fn toggle_visual(&mut self, target: EditorMode) {
         if self.mode == target {
             self.leave_visual();
@@ -246,103 +245,12 @@ impl EditorView {
         }
     }
 
-    fn cancel_command(&mut self) {
-        self.mode = EditorMode::Normal;
-        self.command.clear();
-        self.command_selection = 0;
-    }
-
-    fn run_command_from_palette(&mut self) {
-        let raw = self.command.trim().to_string();
-        let force = raw.ends_with('!');
-        let filtered = filter_commands(&raw);
-        let to_run = match filtered
-            .get(self.command_selection.min(filtered.len().saturating_sub(1)))
-            .copied()
-        {
-            Some(idx) => {
-                let key = COMMANDS[idx].key.to_string();
-                if force { format!("{}!", key) } else { key }
-            }
-            None => raw,
-        };
-        self.command.clear();
-        self.command_selection = 0;
-        self.mode = EditorMode::Normal;
-        self.execute_command(&to_run);
-    }
-
-    fn command_backspace(&mut self) {
-        if self.command.pop().is_none() {
-            self.mode = EditorMode::Normal;
-        }
-        self.command_selection = 0;
-    }
-
-    fn command_select_down(&mut self) {
-        let filtered = filter_commands(&self.command);
-        if !filtered.is_empty() {
-            self.command_selection = (self.command_selection + 1).min(filtered.len() - 1);
-        }
-    }
-
     fn run_search(&mut self) {
         let pattern = self.search.clone();
         self.mode = EditorMode::Normal;
         if !pattern.is_empty() {
             self.last_search = Some(pattern);
             self.repeat_search(true);
-        }
-    }
-
-    fn execute_command(&mut self, cmd: &str) {
-        let (base, force) = match cmd.strip_suffix('!') {
-            Some(rest) => (rest, true),
-            None => (cmd, false),
-        };
-        match base {
-            "w" | "write" => self.handle_save_command(),
-            "q" | "close" => self.handle_close_command(force),
-            "wq" | "x" => self.handle_save_and_close_command(),
-            "Q" | "qa" | "quit" => self.handle_quit_command(force),
-            "e" | "edit" | "reload" => self.reload(force),
-            "f" | "find" => self.pending_request = Some(EditorRequest::OpenFinder),
-            "g" | "grep" => self.pending_request = Some(EditorRequest::OpenGrep),
-            "p" | "projects" => self.pending_request = Some(EditorRequest::OpenPicker),
-            "t" | "tree" | "explorer" => self.pending_request = Some(EditorRequest::FocusTree),
-            "b" | "buffer" => self.pending_request = Some(EditorRequest::FocusEditor),
-            "h" | "help" => self.pending_request = Some(EditorRequest::ShowHelp),
-            "" => {}
-            other => self.status = format!("Not an editor command: {}", other),
-        }
-    }
-
-    fn handle_save_command(&mut self) {
-        if let Err(e) = self.save() {
-            self.status = format!("Error: {}", e);
-        }
-    }
-
-    fn handle_close_command(&mut self, force: bool) {
-        if !self.modified || force {
-            self.close_requested = true;
-        } else {
-            self.status = "No write since last change (q! to force)".into();
-        }
-    }
-
-    fn handle_save_and_close_command(&mut self) {
-        match self.save() {
-            Ok(()) => self.close_requested = true,
-            Err(e) => self.status = format!("Error: {}", e),
-        }
-    }
-
-    fn handle_quit_command(&mut self, force: bool) {
-        if !self.modified || force {
-            self.quit_app_requested = true;
-        } else {
-            self.status = "No write since last change (Q! to force)".into();
         }
     }
 }

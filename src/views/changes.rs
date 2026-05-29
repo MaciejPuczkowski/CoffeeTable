@@ -27,7 +27,16 @@ pub enum ChangesAction {
 #[derive(Clone)]
 pub enum ChangesItem {
     Header(String),
-    File { path: PathBuf, status: GitStatus },
+    Dir {
+        name: String,
+        depth: u16,
+    },
+    File {
+        name: String,
+        path: PathBuf,
+        status: GitStatus,
+        depth: u16,
+    },
 }
 
 impl ChangesView {
@@ -85,29 +94,12 @@ impl ChangesView {
                 GitStatus::Untracked => untracked.push((p.clone(), *s)),
             }
         }
-        staged.sort_by(|a, b| a.0.cmp(&b.0));
-        modified.sort_by(|a, b| a.0.cmp(&b.0));
-        untracked.sort_by(|a, b| a.0.cmp(&b.0));
 
+        let root = self.root.clone();
         let mut items = Vec::new();
-        if !staged.is_empty() {
-            items.push(ChangesItem::Header(format!("Staged ({})", staged.len())));
-            for (p, s) in staged {
-                items.push(ChangesItem::File { path: p, status: s });
-            }
-        }
-        if !modified.is_empty() {
-            items.push(ChangesItem::Header(format!("Modified ({})", modified.len())));
-            for (p, s) in modified {
-                items.push(ChangesItem::File { path: p, status: s });
-            }
-        }
-        if !untracked.is_empty() {
-            items.push(ChangesItem::Header(format!("Untracked ({})", untracked.len())));
-            for (p, s) in untracked {
-                items.push(ChangesItem::File { path: p, status: s });
-            }
-        }
+        push_section(&mut items, "Staged", &mut staged, &root);
+        push_section(&mut items, "Modified", &mut modified, &root);
+        push_section(&mut items, "Untracked", &mut untracked, &root);
         self.items = items;
         self.restore_selection(prev);
     }
@@ -140,7 +132,53 @@ impl ChangesView {
             .iter()
             .position(|it| matches!(it, ChangesItem::File { .. }))
     }
+}
 
+fn push_section(
+    items: &mut Vec<ChangesItem>,
+    title: &str,
+    files: &mut Vec<(PathBuf, GitStatus)>,
+    root: &Path,
+) {
+    if files.is_empty() {
+        return;
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    items.push(ChangesItem::Header(format!("{} ({})", title, files.len())));
+    let mut current: Vec<String> = Vec::new();
+    for (path, status) in files.iter() {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let components: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if components.is_empty() {
+            continue;
+        }
+        let (dirs, filename) = components.split_at(components.len() - 1);
+        let common = current
+            .iter()
+            .zip(dirs.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        current.truncate(common);
+        for d in dirs.iter().skip(common) {
+            current.push(d.clone());
+            items.push(ChangesItem::Dir {
+                name: d.clone(),
+                depth: (current.len() - 1) as u16,
+            });
+        }
+        items.push(ChangesItem::File {
+            name: filename[0].clone(),
+            path: path.clone(),
+            status: *status,
+            depth: dirs.len() as u16,
+        });
+    }
+}
+
+impl ChangesView {
     pub fn move_down(&mut self) {
         let Some(curr) = self.list_state.selected() else {
             if let Some(i) = self.first_selectable() {
@@ -223,7 +261,6 @@ impl<'a> Widget for ChangesWidget<'a> {
         let header_style = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD);
-        let root = self.view.root.clone();
         let items: Vec<ListItem> = if self.view.items.is_empty() {
             vec![ListItem::new(Line::from(Span::styled(
                 "  (no changes)",
@@ -238,12 +275,25 @@ impl<'a> Widget for ChangesWidget<'a> {
                         format!("── {} ──", t),
                         header_style,
                     ))),
-                    ChangesItem::File { path, status } => {
-                        let rel = path
-                            .strip_prefix(&root)
-                            .unwrap_or(path)
-                            .to_string_lossy()
-                            .to_string();
+                    ChangesItem::Dir { name, depth } => {
+                        let indent = "  ".repeat(*depth as usize);
+                        ListItem::new(Line::from(vec![
+                            Span::raw(format!("  {}", indent)),
+                            Span::styled(
+                                format!("{}/", name),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]))
+                    }
+                    ChangesItem::File {
+                        name,
+                        status,
+                        depth,
+                        ..
+                    } => {
+                        let indent = "  ".repeat(*depth as usize);
                         let style = match status {
                             GitStatus::Untracked => Style::default().fg(Color::Red),
                             GitStatus::Modified => Style::default().fg(Color::Yellow),
@@ -255,10 +305,9 @@ impl<'a> Widget for ChangesWidget<'a> {
                             GitStatus::Staged => "A ",
                         };
                         ListItem::new(Line::from(vec![
-                            Span::raw("  "),
                             Span::styled(badge.to_string(), style),
-                            Span::raw("  "),
-                            Span::styled(rel, style),
+                            Span::raw(format!("  {}", indent)),
+                            Span::styled(name.clone(), style),
                         ]))
                     }
                 })

@@ -29,16 +29,18 @@ pub struct GrepView {
     pub hits: Vec<Hit>,
     pub list_state: ListState,
     pub error: Option<String>,
+    pub excludes: Vec<String>,
 }
 
 impl GrepView {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, excludes: Vec<String>) -> Self {
         Self {
             root,
             pattern: String::new(),
             hits: Vec::new(),
             list_state: ListState::default(),
             error: None,
+            excludes,
         }
     }
 
@@ -90,10 +92,15 @@ impl GrepView {
                 return;
             }
         };
+        let exc: std::collections::HashSet<String> = self.excludes.iter().cloned().collect();
         let walker = WalkBuilder::new(&self.root)
             .hidden(false)
             .git_ignore(true)
             .max_filesize(Some(1 * 1024 * 1024))
+            .filter_entry(move |entry| {
+                let name = entry.file_name().to_string_lossy();
+                !exc.contains(name.as_ref())
+            })
             .build();
         for entry in walker.flatten() {
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {

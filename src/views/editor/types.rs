@@ -4,24 +4,20 @@ pub enum EditorMode {
     Insert,
     Visual,
     VisualLine,
-    Command,
     Search,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitView {
+    Working,
+    Head,
+    Diff,
 }
 
 #[derive(Default, Clone)]
 pub struct YankRegister {
     pub text: String,
     pub linewise: bool,
-}
-
-#[derive(Clone, Copy)]
-pub enum EditorRequest {
-    OpenFinder,
-    OpenGrep,
-    OpenPicker,
-    FocusTree,
-    FocusEditor,
-    ShowHelp,
 }
 
 #[derive(Clone)]
@@ -48,6 +44,10 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { key: "t", aliases: &["tree", "explorer"], description: "Focus file tree" },
     CommandDef { key: "b", aliases: &["buffer"], description: "Focus editor" },
     CommandDef { key: "h", aliases: &["help"], description: "Show help overlay" },
+    CommandDef { key: "S", aliases: &["settings", "config"], description: "Open settings.yaml in editor" },
+    CommandDef { key: "H", aliases: &["head", "old"], description: "Show HEAD version of file (read-only)" },
+    CommandDef { key: "W", aliases: &["working", "work", "new"], description: "Back to working copy (editable)" },
+    CommandDef { key: "D", aliases: &["diff"], description: "Show unified diff against HEAD (read-only)" },
 ];
 
 pub fn filter_commands(query: &str) -> Vec<usize> {

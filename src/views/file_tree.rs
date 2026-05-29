@@ -21,6 +21,7 @@ pub struct FileTreeView {
     selected_path: Option<PathBuf>,
     git_status: HashMap<PathBuf, GitStatus>,
     pub last_render_area: Option<Rect>,
+    pub filter: String,
 }
 
 #[derive(Clone)]
@@ -50,6 +51,7 @@ impl FileTreeView {
             selected_path: state.selected_path,
             git_status: HashMap::new(),
             last_render_area: None,
+            filter: String::new(),
         };
         view.expanded.insert(view.root.clone());
         view.rebuild_visible();
@@ -59,6 +61,28 @@ impl FileTreeView {
 
     pub fn set_git_status(&mut self, status: HashMap<PathBuf, GitStatus>) {
         self.git_status = status;
+    }
+
+    pub fn git_status_for(&self, path: &Path) -> Option<GitStatus> {
+        self.git_status.get(path).copied()
+    }
+
+    pub fn set_filter(&mut self, query: String) {
+        let prev_selected = self.selected_path.clone();
+        self.filter = query;
+        self.rebuild_visible();
+        if let Some(p) = prev_selected {
+            self.reselect(&p);
+        } else if !self.visible.is_empty() {
+            self.list_state.select(Some(0));
+            self.selected_path = Some(self.visible[0].path.clone());
+        }
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.rebuild_visible();
+        self.restore_selection();
     }
 
     pub fn mouse_select(&mut self, row: u16) -> Action {
@@ -234,7 +258,12 @@ impl FileTreeView {
     fn rebuild_visible(&mut self) {
         self.visible.clear();
         let root = self.root.clone();
-        self.push_children(&root, 0);
+        if self.filter.is_empty() {
+            self.push_children(&root, 0);
+        } else {
+            let q = self.filter.to_lowercase();
+            self.push_filtered(&root, 0, &q);
+        }
     }
 
     fn push_children(&mut self, dir: &Path, depth: u16) {
@@ -253,6 +282,48 @@ impl FileTreeView {
                 self.push_children(&child, depth + 1);
             }
         }
+    }
+
+    fn push_filtered(&mut self, dir: &Path, depth: u16, query: &str) {
+        let entries = self.load_dir(dir);
+        for e in entries {
+            if e.is_dir {
+                if !self.subtree_has_match(&e.path, query) {
+                    continue;
+                }
+                self.visible.push(VisibleNode {
+                    path: e.path.clone(),
+                    name: e.name.clone(),
+                    depth,
+                    is_dir: true,
+                    is_expanded: true,
+                });
+                let child = e.path.clone();
+                self.push_filtered(&child, depth + 1, query);
+            } else if e.name.to_lowercase().contains(query) {
+                self.visible.push(VisibleNode {
+                    path: e.path.clone(),
+                    name: e.name.clone(),
+                    depth,
+                    is_dir: false,
+                    is_expanded: false,
+                });
+            }
+        }
+    }
+
+    fn subtree_has_match(&mut self, dir: &Path, query: &str) -> bool {
+        let entries = self.load_dir(dir);
+        for e in entries {
+            if e.is_dir {
+                if self.subtree_has_match(&e.path, query) {
+                    return true;
+                }
+            } else if e.name.to_lowercase().contains(query) {
+                return true;
+            }
+        }
+        false
     }
 
     fn load_dir(&mut self, dir: &Path) -> Vec<DirEntry> {
