@@ -1,4 +1,6 @@
-use super::{AiProvider, commit_prompt};
+use super::{
+    AiProvider, CommitPlan, commit_plan_prompt, commit_prompt, parse_commit_plan,
+};
 use anyhow::{Context, Result, anyhow};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -15,10 +17,15 @@ impl ClaudeCli {
     }
 }
 
-impl AiProvider for ClaudeCli {
-    fn generate_commit_message(&self, diff: &str) -> Result<String> {
-        let prompt = commit_prompt(diff);
-        let mut cmd = Command::new(&self.binary);
+impl ClaudeCli {
+    fn run(&self, prompt: &str) -> Result<String> {
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(&self.binary);
+            c
+        } else {
+            Command::new(&self.binary)
+        };
         cmd.arg("-p").arg("--output-format").arg("text");
         if let Some(model) = &self.model {
             cmd.args(["--model", model]);
@@ -50,5 +57,16 @@ impl AiProvider for ClaudeCli {
             return Err(anyhow!("claude returned an empty response"));
         }
         Ok(text)
+    }
+}
+
+impl AiProvider for ClaudeCli {
+    fn generate_commit_message(&self, diff: &str) -> Result<String> {
+        self.run(&commit_prompt(diff))
+    }
+
+    fn generate_commit_plan(&self, diff: &str, untracked: &[String]) -> Result<Vec<CommitPlan>> {
+        let raw = self.run(&commit_plan_prompt(diff, untracked))?;
+        parse_commit_plan(&raw)
     }
 }
