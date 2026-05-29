@@ -29,13 +29,23 @@ pub enum AppMode {
     AiCommit,
 }
 
+pub enum AiResult {
+    Single(String),
+    Plan(Vec<crate::ai::CommitPlan>),
+}
+
 pub enum AiCommitState {
     Loading {
-        rx: std::sync::mpsc::Receiver<Result<String, String>>,
+        rx: std::sync::mpsc::Receiver<Result<AiResult, String>>,
         spinner: usize,
     },
     Reviewing {
-        message: String,
+        editor: EditorView,
+    },
+    ReviewingPlan {
+        messages: Vec<EditorView>,
+        files: Vec<Vec<String>>,
+        current: usize,
     },
     Error(String),
 }
@@ -1016,7 +1026,8 @@ impl App {
         let new_state = if let AiCommitState::Loading { rx, spinner } = &mut overlay.state {
             *spinner = spinner.wrapping_add(1);
             match rx.try_recv() {
-                Ok(Ok(msg)) => Some(AiCommitState::Reviewing { message: msg }),
+                Ok(Ok(AiResult::Single(msg))) => Some(build_review_state(msg)),
+                Ok(Ok(AiResult::Plan(plans))) => Some(build_plan_state(plans)),
                 Ok(Err(e)) => Some(AiCommitState::Error(e)),
                 Err(_) => None,
             }
@@ -1033,14 +1044,7 @@ impl App {
             self.status = "No active project".into();
             return Ok(());
         };
-        let Some(diff) = git::staged_diff(&project.path) else {
-            self.status = "git diff --staged failed".into();
-            return Ok(());
-        };
-        if diff.trim().is_empty() {
-            self.status = "Nothing staged — stage changes first (c on a file)".into();
-            return Ok(());
-        }
+        let staged = git::staged_diff(&project.path).unwrap_or_default();
         let provider = match crate::ai::build_provider(&self.ai_config) {
             Ok(p) => p,
             Err(e) => {
@@ -1049,12 +1053,29 @@ impl App {
             }
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = provider
-                .generate_commit_message(&diff)
-                .map_err(|e| e.to_string());
-            let _ = tx.send(result);
-        });
+        if !staged.trim().is_empty() {
+            std::thread::spawn(move || {
+                let result = provider
+                    .generate_commit_message(&staged)
+                    .map(AiResult::Single)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            });
+        } else {
+            let working = git::working_diff(&project.path).unwrap_or_default();
+            let untracked = git::untracked_files(&project.path);
+            if working.trim().is_empty() && untracked.is_empty() {
+                self.status = "Nothing to commit".into();
+                return Ok(());
+            }
+            std::thread::spawn(move || {
+                let result = provider
+                    .generate_commit_plan(&working, &untracked)
+                    .map(AiResult::Plan)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            });
+        }
         self.ai_commit = Some(AiCommitOverlay {
             state: AiCommitState::Loading { rx, spinner: 0 },
             project_path: project.path,
@@ -1068,44 +1089,165 @@ impl App {
             self.mode = AppMode::Normal;
             return Ok(());
         };
-        match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
-                self.ai_commit = None;
-                self.mode = AppMode::Normal;
-                self.status = "AI commit cancelled".into();
-            }
-            (KeyCode::Char('y'), _) | (KeyCode::Enter, _) => {
-                if let AiCommitState::Reviewing { message } = &overlay.state {
-                    let msg = message.clone();
-                    let project_path = overlay.project_path.clone();
-                    self.ai_commit = None;
-                    self.mode = AppMode::Normal;
-                    match git::commit_with_message(&project_path, &msg) {
-                        Ok(_) => {
-                            let first_line =
-                                msg.lines().next().unwrap_or("").to_string();
-                            self.status = format!("Committed: {}", first_line);
-                            let _ = self.refresh_git_status();
-                        }
-                        Err(e) => {
-                            self.status = format!("git commit failed: {}", e.lines().next().unwrap_or(""))
-                        }
-                    }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match &mut overlay.state {
+            AiCommitState::Loading { .. } => {
+                if key.code == KeyCode::Esc {
+                    self.cancel_ai_commit();
                 }
             }
-            (KeyCode::Char('r'), _) => {
-                if matches!(
-                    overlay.state,
-                    AiCommitState::Reviewing { .. } | AiCommitState::Error(_)
-                ) {
+            AiCommitState::Error(e) => match key.code {
+                KeyCode::Char('y') => {
+                    crate::clipboard::copy(e);
+                    self.status = "Error copied to clipboard".into();
+                }
+                KeyCode::Char('r') => {
                     self.ai_commit = None;
                     self.mode = AppMode::Normal;
                     self.start_ai_commit()?;
                 }
+                KeyCode::Esc => self.cancel_ai_commit(),
+                _ => {}
+            },
+            AiCommitState::Reviewing { editor } => {
+                if ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Enter) {
+                    let message = editor_text(editor);
+                    let project_path = overlay.project_path.clone();
+                    self.ai_commit = None;
+                    self.mode = AppMode::Normal;
+                    self.commit_message(&project_path, &message);
+                    return Ok(());
+                }
+                if ctrl && matches!(key.code, KeyCode::Char('r')) {
+                    self.ai_commit = None;
+                    self.mode = AppMode::Normal;
+                    self.start_ai_commit()?;
+                    return Ok(());
+                }
+                if key.code == KeyCode::Esc && editor.mode == EditorMode::Normal {
+                    self.cancel_ai_commit();
+                    return Ok(());
+                }
+                editor.handle_key(key);
+                let status = std::mem::take(&mut editor.status);
+                if !status.is_empty() {
+                    self.status = status;
+                }
+                editor.did_save = false;
+                editor.request_focus_tree = false;
             }
-            _ => {}
+            AiCommitState::ReviewingPlan {
+                messages,
+                files,
+                current,
+            } => {
+                if ctrl && matches!(key.code, KeyCode::Char('n')) {
+                    *current = (*current + 1).min(messages.len().saturating_sub(1));
+                    return Ok(());
+                }
+                if ctrl && matches!(key.code, KeyCode::Char('p')) {
+                    *current = current.saturating_sub(1);
+                    return Ok(());
+                }
+                if ctrl && matches!(key.code, KeyCode::Char('r')) {
+                    self.ai_commit = None;
+                    self.mode = AppMode::Normal;
+                    self.start_ai_commit()?;
+                    return Ok(());
+                }
+                if ctrl && matches!(key.code, KeyCode::Char('s')) {
+                    let plan_messages: Vec<String> =
+                        messages.iter().map(editor_text).collect();
+                    let plan_files = files.clone();
+                    let project_path = overlay.project_path.clone();
+                    self.ai_commit = None;
+                    self.mode = AppMode::Normal;
+                    self.execute_commit_plan(&project_path, &plan_messages, &plan_files);
+                    return Ok(());
+                }
+                let cur = *current;
+                let editor = match messages.get_mut(cur) {
+                    Some(e) => e,
+                    None => return Ok(()),
+                };
+                if key.code == KeyCode::Esc && editor.mode == EditorMode::Normal {
+                    self.cancel_ai_commit();
+                    return Ok(());
+                }
+                editor.handle_key(key);
+                let status = std::mem::take(&mut editor.status);
+                if !status.is_empty() {
+                    self.status = status;
+                }
+                editor.did_save = false;
+                editor.request_focus_tree = false;
+            }
         }
         Ok(())
+    }
+
+    fn execute_commit_plan(
+        &mut self,
+        project_path: &PathBuf,
+        messages: &[String],
+        files: &[Vec<String>],
+    ) {
+        let mut total = 0usize;
+        for (i, (msg, files)) in messages.iter().zip(files.iter()).enumerate() {
+            let trimmed = msg.trim();
+            if trimmed.is_empty() {
+                self.status = format!("Commit {}: empty message — aborted", i + 1);
+                let _ = self.refresh_git_status();
+                return;
+            }
+            for f in files {
+                let rel = std::path::PathBuf::from(f);
+                if !git::stage(project_path, &rel) {
+                    self.status = format!("git add {} failed at commit {}", f, i + 1);
+                    let _ = self.refresh_git_status();
+                    return;
+                }
+            }
+            match git::commit_with_message(project_path, trimmed) {
+                Ok(_) => total += 1,
+                Err(e) => {
+                    self.status = format!(
+                        "commit {} failed: {}",
+                        i + 1,
+                        e.lines().next().unwrap_or("")
+                    );
+                    let _ = self.refresh_git_status();
+                    return;
+                }
+            }
+        }
+        self.status = format!("Created {} commits", total);
+        let _ = self.refresh_git_status();
+    }
+
+    fn cancel_ai_commit(&mut self) {
+        self.ai_commit = None;
+        self.mode = AppMode::Normal;
+        self.status = "AI commit cancelled".into();
+    }
+
+    fn commit_message(&mut self, project_path: &PathBuf, message: &str) {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            self.status = "Empty commit message".into();
+            return;
+        }
+        match git::commit_with_message(project_path, trimmed) {
+            Ok(_) => {
+                let first = trimmed.lines().next().unwrap_or("").to_string();
+                self.status = format!("Committed: {}", first);
+                let _ = self.refresh_git_status();
+            }
+            Err(e) => {
+                self.status =
+                    format!("git commit failed: {}", e.lines().next().unwrap_or(""));
+            }
+        }
     }
 
     fn toggle_stage_all(&mut self) -> Result<()> {
@@ -1698,6 +1840,48 @@ impl App {
             }
         }
         Ok(())
+    }
+}
+
+fn editor_text(editor: &EditorView) -> String {
+    editor
+        .lines
+        .iter()
+        .map(|l| l.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn build_review_state(message: String) -> AiCommitState {
+    let path = std::env::temp_dir().join("coffeetable_commit_msg.txt");
+    match EditorView::from_content(path, message.clone()) {
+        Ok(view) => AiCommitState::Reviewing { editor: view },
+        Err(_) => AiCommitState::Error(format!("Editor init failed for: {}", message)),
+    }
+}
+
+fn build_plan_state(plans: Vec<crate::ai::CommitPlan>) -> AiCommitState {
+    let mut messages = Vec::with_capacity(plans.len());
+    let mut files = Vec::with_capacity(plans.len());
+    for (i, plan) in plans.into_iter().enumerate() {
+        let path = std::env::temp_dir().join(format!("coffeetable_plan_{}.txt", i));
+        match EditorView::from_content(path, plan.message) {
+            Ok(view) => {
+                messages.push(view);
+                files.push(plan.files);
+            }
+            Err(e) => {
+                return AiCommitState::Error(format!("Editor init failed: {}", e));
+            }
+        }
+    }
+    if messages.is_empty() {
+        return AiCommitState::Error("AI returned no commits".into());
+    }
+    AiCommitState::ReviewingPlan {
+        messages,
+        files,
+        current: 0,
     }
 }
 
