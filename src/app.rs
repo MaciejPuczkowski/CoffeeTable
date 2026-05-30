@@ -24,6 +24,7 @@ pub enum AppMode {
     Picker,
     Grep,
     OpenConfirm,
+    ConfirmDeleteFeature,
     Palette,
     ExplorerFilter,
     AiCommit,
@@ -84,6 +85,8 @@ pub enum ViewMode {
     Editor,
     Terminal,
     Project,
+    Agents,
+    Git,
 }
 
 pub struct ProjectViewState {
@@ -95,8 +98,12 @@ pub struct ProjectViewState {
     pub preferred_git_view: GitView,
     pub terminals: Vec<crate::views::terminal::TerminalView>,
     pub active_terminal: Option<usize>,
+    pub agents: Vec<crate::views::agents::AgentSession>,
+    pub active_agent: Option<usize>,
+    pub agent_resumed_this_run: bool,
     pub view_mode: ViewMode,
     pub project_view: Option<crate::views::project_view::ProjectViewModel>,
+    pub git_view: Option<crate::views::git::GitTreeView>,
 }
 
 impl ProjectViewState {
@@ -116,6 +123,7 @@ impl ProjectViewState {
 pub struct App {
     pub db: Db,
     pub settings_path: PathBuf,
+    pub paths: crate::config::Paths,
     pub roots: Vec<PathBuf>,
     pub search_excludes: Vec<String>,
     pub ai_config: crate::config::AiConfig,
@@ -129,6 +137,7 @@ pub struct App {
     pub palette: Option<PaletteState>,
     pub ai_commit: Option<AiCommitOverlay>,
     pub pending_open: Option<PendingOpen>,
+    pub pending_delete_feature: Option<(i64, String)>,
     pub should_quit: bool,
     pub status: String,
     pub help_visible: bool,
@@ -141,6 +150,9 @@ pub struct App {
     pub terminal_tabs_area: Rect,
     pub terminal_tab_rects: Vec<Rect>,
     pub terminal_new_rect: Option<Rect>,
+    pub agent_tabs_area: Rect,
+    pub agent_tab_rects: Vec<Rect>,
+    pub agent_new_rect: Option<Rect>,
     pub left_pane_area: Rect,
     pub right_pane_area: Rect,
     pub project_list_inner: Rect,
@@ -150,7 +162,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(db: Db, settings_path: PathBuf) -> Result<Self> {
+    pub fn new(db: Db, paths: crate::config::Paths) -> Result<Self> {
+        let settings_path = paths.settings_file.clone();
         let settings = Settings::load_or_seed(&settings_path)?;
         let roots = settings.roots;
         let search_excludes = settings.search_excludes;
@@ -185,8 +198,12 @@ impl App {
                     preferred_git_view: GitView::Working,
                     terminals: Vec::new(),
                     active_terminal: None,
+                    agents: Vec::new(),
+                    active_agent: None,
+                    agent_resumed_this_run: false,
                     view_mode: ViewMode::Editor,
                     project_view: None,
+                    git_view: None,
                 },
             );
         }
@@ -205,6 +222,7 @@ impl App {
         Ok(Self {
             db,
             settings_path,
+            paths,
             roots,
             search_excludes,
             ai_config,
@@ -218,6 +236,7 @@ impl App {
             palette: None,
             ai_commit: None,
             pending_open: None,
+            pending_delete_feature: None,
             should_quit: false,
             status: String::new(),
             help_visible: false,
@@ -230,6 +249,9 @@ impl App {
             terminal_tabs_area: Rect::default(),
             terminal_tab_rects: Vec::new(),
             terminal_new_rect: None,
+            agent_tabs_area: Rect::default(),
+            agent_tab_rects: Vec::new(),
+            agent_new_rect: None,
             left_pane_area: Rect::default(),
             right_pane_area: Rect::default(),
             project_list_inner: Rect::default(),
@@ -307,6 +329,7 @@ impl App {
             AppMode::Picker => self.on_key_picker(key)?,
             AppMode::Grep => self.on_key_grep(key)?,
             AppMode::OpenConfirm => self.on_key_open_confirm(key)?,
+            AppMode::ConfirmDeleteFeature => self.on_key_confirm_delete_feature(key)?,
             AppMode::Palette => self.on_key_palette(key)?,
             AppMode::ExplorerFilter => self.on_key_explorer_filter(key)?,
             AppMode::AiCommit => self.on_key_ai_commit(key)?,
@@ -368,7 +391,7 @@ impl App {
             (KeyCode::Up, _) | (KeyCode::BackTab, _) => {
                 palette.selection = palette.selection.saturating_sub(1);
             }
-            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) => {
                 palette.query.push(c);
                 palette.selection = 0;
             }
@@ -605,7 +628,7 @@ impl App {
         let Some(state) = self.active_state_ref() else {
             return true;
         };
-        if matches!(state.view_mode, ViewMode::Terminal) {
+        if matches!(state.view_mode, ViewMode::Terminal | ViewMode::Agents) {
             return false;
         }
         if matches!(state.view_mode, ViewMode::Project) {
@@ -692,6 +715,9 @@ impl App {
             KeyCode::Char('t') => self.open_or_focus_terminal()?,
             KeyCode::Char('T') => self.new_terminal()?,
             KeyCode::Char('P') => self.open_project_view()?,
+            KeyCode::Char('G') => self.open_git_view()?,
+            KeyCode::Char('a') => self.agent_for_selected_feature()?,
+            KeyCode::Char('z') => self.cycle_editor_wrap(),
             KeyCode::Char('?') => self.help_visible = true,
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char(' ') => {}
@@ -750,6 +776,18 @@ impl App {
         }
     }
 
+    fn cycle_editor_wrap(&mut self) {
+        let label = self.active_state().and_then(|s| {
+            s.editor.as_mut().map(|e| {
+                e.cycle_wrap();
+                e.wrap_mode.label()
+            })
+        });
+        if let Some(label) = label {
+            self.status = label.to_string();
+        }
+    }
+
     fn on_key_open_confirm(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
             (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) | (KeyCode::Enter, _) => {
@@ -763,6 +801,19 @@ impl App {
                 self.pending_open = None;
                 self.mode = AppMode::Normal;
                 self.status = "Open cancelled".into();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn on_key_confirm_delete_feature(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) | (KeyCode::Enter, _) => {
+                self.confirm_delete_feature()?;
+            }
+            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
+                self.cancel_delete_feature();
             }
             _ => {}
         }
@@ -804,10 +855,46 @@ impl App {
                                     let _ = self.new_terminal();
                                 }
                             }
+                            if matches!(mode, ViewMode::Agents) {
+                                let _ = self.ensure_agents_restored();
+                                let need = self
+                                    .active_state_ref()
+                                    .map(|s| s.agents.is_empty())
+                                    .unwrap_or(false);
+                                if need {
+                                    let _ = self.new_agent();
+                                }
+                            }
                             return Ok(());
                         }
                     }
-                } else if contains(self.terminal_tabs_area, col, row) {
+                } else if contains(self.agent_tabs_area, col, row)
+                    && matches!(self.current_view_mode(), Some(ViewMode::Agents))
+                {
+                    if let Some(new_rect) = self.agent_new_rect {
+                        if contains(new_rect, col, row) {
+                            let _ = self.new_agent();
+                            return Ok(());
+                        }
+                    }
+                    let hits: Vec<(usize, Rect)> = self
+                        .agent_tab_rects
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| (i, *r))
+                        .collect();
+                    for (idx, rect) in hits {
+                        if contains(rect, col, row) {
+                            if let Some(state) = self.active_state() {
+                                state.active_agent = Some(idx);
+                                state.view_mode = ViewMode::Agents;
+                            }
+                            return Ok(());
+                        }
+                    }
+                } else if contains(self.terminal_tabs_area, col, row)
+                    && matches!(self.current_view_mode(), Some(ViewMode::Terminal))
+                {
                     if let Some(new_rect) = self.terminal_new_rect {
                         if contains(new_rect, col, row) {
                             let _ = self.new_terminal();
@@ -987,6 +1074,26 @@ impl App {
 
     fn scroll_at(&mut self, col: u16, row: u16, delta: i32) {
         let view_mode = self.current_view_mode();
+        if matches!(view_mode, Some(ViewMode::Agents)) {
+            if let Some(s) = self.active_state() {
+                if let Some(i) = s.active_agent {
+                    if let Some(agent) = s.agents.get_mut(i) {
+                        agent.scroll(-delta);
+                    }
+                }
+            }
+            return;
+        }
+        if matches!(view_mode, Some(ViewMode::Terminal)) {
+            if let Some(s) = self.active_state() {
+                if let Some(i) = s.active_terminal {
+                    if let Some(term) = s.terminals.get_mut(i) {
+                        term.scroll(-delta);
+                    }
+                }
+            }
+            return;
+        }
         if matches!(view_mode, Some(ViewMode::Project)) {
             if contains(self.right_pane_area, col, row) {
                 if let Some(model) = self
@@ -1133,12 +1240,13 @@ impl App {
             }
             AppMode::Grep
             | AppMode::OpenConfirm
+            | AppMode::ConfirmDeleteFeature
             | AppMode::Palette
             | AppMode::ExplorerFilter
             | AppMode::AiCommit => false,
             AppMode::Normal => {
                 if let Some(state) = self.active_state_ref() {
-                    if matches!(state.view_mode, ViewMode::Terminal) {
+                    if matches!(state.view_mode, ViewMode::Terminal | ViewMode::Agents) {
                         return false;
                     }
                     if state.focus == Focus::Editor {
@@ -1161,7 +1269,9 @@ impl App {
             .unwrap_or(ViewMode::Editor);
         match mode {
             ViewMode::Terminal => return self.on_key_terminal(key),
+            ViewMode::Agents => return self.on_key_agents(key),
             ViewMode::Project => return self.on_key_project_view(key),
+            ViewMode::Git => return self.on_key_git_view(key),
             ViewMode::Editor => {}
         }
         if self.handle_global_normal(key)? {
@@ -1179,7 +1289,13 @@ impl App {
     }
 
     fn cycle_view_mode(&mut self, forward: bool) {
-        let order = [ViewMode::Editor, ViewMode::Terminal, ViewMode::Project];
+        let order = [
+            ViewMode::Editor,
+            ViewMode::Terminal,
+            ViewMode::Agents,
+            ViewMode::Project,
+            ViewMode::Git,
+        ];
         if let Some(state) = self.active_state() {
             let cur = order.iter().position(|m| *m == state.view_mode).unwrap_or(0);
             let next = if forward {
@@ -1207,10 +1323,40 @@ impl App {
                     let _ = self.new_terminal();
                 }
             }
+            ViewMode::Agents => {
+                let _ = self.ensure_agents_restored();
+                let needs_spawn = self
+                    .active_state_ref()
+                    .map(|s| s.agents.is_empty())
+                    .unwrap_or(false);
+                if needs_spawn {
+                    let _ = self.new_agent();
+                }
+            }
             ViewMode::Project => {
                 self.ensure_project_view_loaded();
             }
+            ViewMode::Git => {
+                self.ensure_git_view_loaded();
+            }
             ViewMode::Editor => {}
+        }
+    }
+
+    pub fn ensure_git_view_loaded(&mut self) {
+        let Some(project) = self.active_project().cloned() else {
+            return;
+        };
+        let already = self
+            .active_state_ref()
+            .map(|s| s.git_view.is_some())
+            .unwrap_or(false);
+        if already {
+            return;
+        }
+        let view = crate::views::git::GitTreeView::new(project.path.clone());
+        if let Some(state) = self.active_state() {
+            state.git_view = Some(view);
         }
     }
 
@@ -1836,7 +1982,7 @@ impl App {
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) => picker.cancel_input(),
                 (KeyCode::Backspace, _) => picker.pop_char(),
-                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => picker.push_char(c),
+                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) => picker.push_char(c),
                 _ => consumed = false,
             }
         }
@@ -1898,7 +2044,7 @@ impl App {
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) => picker.cancel_input(),
                 (KeyCode::Backspace, _) => picker.pop_char(),
-                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => picker.push_char(c),
+                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) => picker.push_char(c),
                 _ => consumed = false,
             }
         }
@@ -2020,7 +2166,7 @@ impl App {
             }
             (KeyCode::Up, _) => state.tree.move_up(),
             (KeyCode::Down, _) => state.tree.move_down(),
-            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) => {
                 let mut q = state.tree.filter.clone();
                 q.push(c);
                 state.tree.set_filter(q);
@@ -2040,7 +2186,7 @@ impl App {
                 (KeyCode::Down, _) => grep.move_down(),
                 (KeyCode::Up, _) => grep.move_up(),
                 (KeyCode::Backspace, _) => grep.pop_char(),
-                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => grep.push_char(c),
+                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) => grep.push_char(c),
                 _ => consumed = false,
             }
         }
@@ -2100,8 +2246,12 @@ impl App {
                     preferred_git_view: GitView::Working,
                     terminals: Vec::new(),
                     active_terminal: None,
+                    agents: Vec::new(),
+                    active_agent: None,
+                    agent_resumed_this_run: false,
                     view_mode: ViewMode::Editor,
                     project_view: None,
+                    git_view: None,
                 },
             );
             self.open_projects.push(project);
@@ -2127,6 +2277,144 @@ impl App {
         }
         self.ensure_project_view_loaded();
         Ok(())
+    }
+
+    fn open_git_view(&mut self) -> Result<()> {
+        if let Some(state) = self.active_state() {
+            state.view_mode = ViewMode::Git;
+        }
+        self.ensure_git_view_loaded();
+        Ok(())
+    }
+
+    fn on_key_git_view(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::views::git::DetailsMode;
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.with_git_view(|v| v.move_down()),
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.with_git_view(|v| v.move_up()),
+            (KeyCode::Char('g'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                self.with_git_view(|v| v.jump_top());
+            }
+            (KeyCode::Char('G'), _) => self.with_git_view(|v| v.jump_bottom()),
+            (KeyCode::Tab, _) => self.with_git_view(|v| v.cycle_pane(true)),
+            (KeyCode::BackTab, _) => self.with_git_view(|v| v.cycle_pane(false)),
+            (KeyCode::Enter, _) | (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
+                self.with_git_view(|v| v.activate());
+            }
+            (KeyCode::Esc, _) | (KeyCode::Backspace, _) | (KeyCode::Char('h'), _)
+            | (KeyCode::Left, _) => {
+                let in_pr = self
+                    .active_state_ref()
+                    .and_then(|s| s.git_view.as_ref())
+                    .map(|v| !matches!(v.details_mode, DetailsMode::Commit))
+                    .unwrap_or(false);
+                if in_pr {
+                    self.with_git_view(|v| v.back_to_pr_list());
+                }
+            }
+            (KeyCode::Char('r'), _) => {
+                self.with_git_view(|v| v.refresh_all());
+                let _ = self.refresh_git_status();
+            }
+            (KeyCode::Char('c'), _) => self.git_view_checkout(),
+            (KeyCode::Char('p'), _) => self.git_view_push(),
+            (KeyCode::Char('P'), _) => self.git_view_pull(),
+            (KeyCode::Char('m'), _) => self.git_view_merge(),
+            (KeyCode::Char('R'), _) => self.git_view_create_pr(),
+            (KeyCode::Char('V'), _) => self.git_view_load_prs(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn with_git_view(&mut self, mut f: impl FnMut(&mut crate::views::git::GitTreeView)) {
+        if let Some(view) = self
+            .active_state()
+            .and_then(|s| s.git_view.as_mut())
+        {
+            f(view);
+        }
+    }
+
+    fn git_view_checkout(&mut self) {
+        let result = self
+            .active_state()
+            .and_then(|s| s.git_view.as_mut())
+            .map(|v| v.checkout_selected());
+        match result {
+            Some(Ok(out)) => {
+                self.status = git_first_line(&out, "Checked out");
+                let _ = self.refresh_git_status();
+            }
+            Some(Err(e)) => self.status = format!("checkout failed: {}", git_first_line(&e, "")),
+            None => {}
+        }
+    }
+
+    fn git_view_pull(&mut self) {
+        let result = self
+            .active_state()
+            .and_then(|s| s.git_view.as_mut())
+            .map(|v| v.pull());
+        match result {
+            Some(Ok(out)) => {
+                self.status = git_first_line(&out, "Pulled");
+                let _ = self.refresh_git_status();
+            }
+            Some(Err(e)) => self.status = format!("pull failed: {}", git_first_line(&e, "")),
+            None => {}
+        }
+    }
+
+    fn git_view_push(&mut self) {
+        let result = self
+            .active_state()
+            .and_then(|s| s.git_view.as_mut())
+            .map(|v| v.push());
+        match result {
+            Some(Ok(out)) => self.status = git_first_line(&out, "Pushed"),
+            Some(Err(e)) => self.status = format!("push failed: {}", git_first_line(&e, "")),
+            None => {}
+        }
+    }
+
+    fn git_view_merge(&mut self) {
+        let result = self
+            .active_state()
+            .and_then(|s| s.git_view.as_mut())
+            .map(|v| v.merge_selected_into_current());
+        match result {
+            Some(Ok(out)) => {
+                self.status = git_first_line(&out, "Merged");
+                let _ = self.refresh_git_status();
+            }
+            Some(Err(e)) => self.status = format!("merge failed: {}", git_first_line(&e, "")),
+            None => {}
+        }
+    }
+
+    fn git_view_create_pr(&mut self) {
+        let result = self
+            .active_state()
+            .and_then(|s| s.git_view.as_mut())
+            .map(|v| v.create_pr_for_current());
+        match result {
+            Some(Ok(out)) => self.status = git_first_line(&out, "PR created"),
+            Some(Err(e)) => self.status = format!("gh pr create failed: {}", git_first_line(&e, "")),
+            None => {}
+        }
+    }
+
+    fn git_view_load_prs(&mut self) {
+        let result = self
+            .active_state()
+            .and_then(|s| s.git_view.as_mut())
+            .map(|v| v.load_prs_for_branch());
+        match result {
+            Some(Ok(_)) => self.status = "Loaded PRs".into(),
+            Some(Err(e)) => self.status = format!("gh pr list failed: {}", git_first_line(&e, "")),
+            None => {}
+        }
     }
 
     fn open_or_focus_terminal(&mut self) -> Result<()> {
@@ -2195,11 +2483,388 @@ impl App {
         }
     }
 
+    fn new_agent(&mut self) -> Result<()> {
+        self.spawn_agent(None)
+    }
+
+    fn agent_for_selected_feature(&mut self) -> Result<()> {
+        use crate::views::project_view::{ProjectSelection, feature_filename};
+        let in_project = matches!(self.current_view_mode(), Some(ViewMode::Project));
+        if !in_project {
+            self.status = "Switch to Project view first".into();
+            return Ok(());
+        }
+        let selection = self
+            .active_state_ref()
+            .and_then(|s| s.project_view.as_ref())
+            .map(|m| m.selection);
+        let Some(ProjectSelection::Feature(i)) = selection else {
+            self.status = "Select a feature first".into();
+            return Ok(());
+        };
+        let feature_info = self
+            .active_state_ref()
+            .and_then(|s| s.project_view.as_ref())
+            .and_then(|m| m.features.get(i))
+            .map(|f| (f.id, f.title.clone(), feature_filename(f)));
+        let Some((feature_id, feature_title, feature_file)) = feature_info else {
+            return Ok(());
+        };
+        let Some(project) = self.active_project().cloned() else { return Ok(()); };
+
+        let context_dir = self.write_agent_project_context(project.id, &project.name)?;
+        if let Some(state) = self.active_state() {
+            state.view_mode = ViewMode::Agents;
+        }
+        self.ensure_agents_restored()?;
+        self.new_agent()?;
+
+        let message = format!(
+            "Take feature #{id} \"{title}\". Start by reading {dir}/index.md, then {dir}/features/{file}. \
+             Mark it in progress first (`coffeetable agent set-feature-status --feature-id {id} --status in_progress`), \
+             then implement the Steps section. When done, set status to in_review and log the result with `coffeetable agent log-turn`.",
+            id = feature_id,
+            title = feature_title,
+            dir = context_dir.display(),
+            file = feature_file,
+        );
+        let mut bytes = message.into_bytes();
+        bytes.push(b'\r');
+        self.write_to_active_agent(&bytes);
+        Ok(())
+    }
+
+    fn spawn_agent(&mut self, resume_session_id: Option<String>) -> Result<()> {
+        let ai = self.ai_config.clone();
+        let Some(project) = self.active_project().cloned() else {
+            self.status = "No active project".into();
+            return Ok(());
+        };
+        let context_dir = self.write_agent_project_context(project.id, &project.name)?;
+        let prompt = self.agent_system_prompt(&project.name, project.id, &context_dir);
+        let name = {
+            let count = self
+                .active_state_ref()
+                .map(|s| s.agents.len())
+                .unwrap_or(0);
+            let suffix = if resume_session_id.is_some() { " (resumed)" } else { "" };
+            format!("{} #{}{}", ai.provider, count + 1, suffix)
+        };
+        match crate::views::agents::AgentSession::spawn(
+            &ai,
+            name,
+            &project.path,
+            Some(&prompt),
+            resume_session_id.as_deref(),
+            24,
+            80,
+        ) {
+            Ok(agent) => {
+                if let Some(state) = self.active_state() {
+                    state.agents.push(agent);
+                    state.active_agent = Some(state.agents.len() - 1);
+                    state.view_mode = ViewMode::Agents;
+                }
+                self.persist_agent_sessions(project.id);
+            }
+            Err(e) => {
+                self.status = format!("Failed to spawn agent: {}", e);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_agents_restored(&mut self) -> Result<()> {
+        let Some(project) = self.active_project().cloned() else { return Ok(()) };
+        if self
+            .active_state_ref()
+            .map(|s| s.agent_resumed_this_run || !s.agents.is_empty())
+            .unwrap_or(true)
+        {
+            return Ok(());
+        }
+        let saved = self.db.load_agent_sessions(project.id).unwrap_or_default();
+        if let Some(state) = self.active_state() {
+            state.agent_resumed_this_run = true;
+        }
+        if saved.is_empty() {
+            return Ok(());
+        }
+        for id in saved {
+            self.spawn_agent(Some(id))?;
+        }
+        Ok(())
+    }
+
+    fn persist_agent_sessions(&mut self, project_id: i64) {
+        let ids: Vec<String> = self
+            .project_views
+            .get(&project_id)
+            .map(|s| {
+                s.agents
+                    .iter()
+                    .filter_map(|a| a.session_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let _ = self.db.save_agent_sessions(project_id, &ids);
+    }
+
+    fn capture_active_agent_session(&mut self) {
+        let Some(project_id) = self.active_project().map(|p| p.id) else { return };
+        let captured = {
+            let Some(state) = self.active_state() else { return };
+            let Some(i) = state.active_agent else { return };
+            let Some(agent) = state.agents.get_mut(i) else { return };
+            agent.try_capture_session_id()
+        };
+        if captured {
+            self.persist_agent_sessions(project_id);
+        }
+    }
+
+    fn write_agent_project_context(
+        &mut self,
+        project_id: i64,
+        project_name: &str,
+    ) -> Result<std::path::PathBuf> {
+        let meta = self.db.load_project_meta(project_id)?;
+        let features = self.db.list_features(project_id)?;
+        let dir = self.paths.project_context_dir(project_id);
+        Self::write_context_files(&dir, project_name, &meta, &features)?;
+        Ok(dir)
+    }
+
+    fn write_context_files(
+        dir: &std::path::Path,
+        project_name: &str,
+        meta: &crate::project::ProjectMeta,
+        features: &[crate::project::Feature],
+    ) -> Result<()> {
+        use crate::views::project_view;
+        std::fs::create_dir_all(dir)?;
+        let features_dir = dir.join("features");
+        std::fs::create_dir_all(&features_dir)?;
+        std::fs::write(
+            dir.join("index.md"),
+            project_view::index_markdown(project_name, features),
+        )?;
+        for section in ["about", "conventions", "ai_hints", "ai_notes"] {
+            let body = project_view::meta_section_body(meta, section);
+            std::fs::write(dir.join(format!("{}.md", section)), body)?;
+        }
+        let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for f in features {
+            let fname = project_view::feature_filename(f);
+            std::fs::write(features_dir.join(&fname), project_view::feature_markdown(f))?;
+            keep.insert(fname);
+        }
+        if let Ok(entries) = std::fs::read_dir(&features_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if !keep.contains(name) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn agent_system_prompt(
+        &self,
+        project_name: &str,
+        project_id: i64,
+        context_dir: &std::path::Path,
+    ) -> String {
+        format!(
+            "You are running inside CoffeeTable as an agent attached to project \"{name}\" (project_id = {pid}).\n\n\
+Always reply in the same natural language the user used in their most recent message. If they write in Polish, respond in Polish; if they switch to English, switch with them. Default to English only when the user's language is unclear.\n\n\
+You start with no project metadata in context. The user will tell you which sections / features to read; do NOT preload them on your own.\n\n\
+Available context files (read on demand, only when the user asks or it's clearly needed):\n  {dir}/index.md            — table of contents (list of features + their files)\n  {dir}/about.md            — project description\n  {dir}/conventions.md      — project conventions\n  {dir}/ai_hints.md         — instructions the user wrote for you\n  {dir}/ai_notes.md         — running notes you may also append to\n  {dir}/features/<file>.md  — one file per feature (see index.md for names + feature_id)\nThese files are regenerated whenever the user saves the Project tab — re-read if you need a refreshed view.\n\n\
+Looking up a feature: when the user asks you to work on a feature (\"do feature X\", \"zrób feature X\", \"implement Y\", or similar), ALWAYS open {dir}/index.md first to find the feature's id and filename, then read {dir}/features/<file>.md before starting. Do not guess the path or the id.\n\n\
+Taking a task: the moment you commit to working on a feature, mark it in progress before doing anything else:\n  coffeetable agent set-feature-status --feature-id <id> --status in_progress\nDo this even if the user only implicitly assigned the task. When the work is finished, set status to `in_review` (the user reviews and bumps to `done`). If you decide not to do it, leave status alone and explain why.\n\n\
+You can write back into the project using the CLI binary `coffeetable` from the shell (run from any cwd):\n  coffeetable agent comment            --feature-id <id> --kind <note|request|response> --message <text>\n  coffeetable agent log-turn           --feature-id <id> --request <text> --response <text>\n  coffeetable agent set-feature-status --feature-id <id> --status <idea|todo|in_progress|in_review|done|cancelled>\n  coffeetable agent append-notes       --project-id {pid} --message <text>\n  coffeetable agent set-notes          --project-id {pid} --message <text>\n  coffeetable agent append-hints       --project-id {pid} --message <text>\n  coffeetable agent set-hints          --project-id {pid} --message <text>\nFor multi-line --message values, pass the text via a single shell-quoted argument.\n\n\
+When you finish a meaningful exchange about a feature, log it as comments:\n  - kind=request for what the user asked\n  - kind=response for your summary/answer\n\
+This keeps the Project tab as the source of truth for the conversation history.",
+            name = project_name,
+            pid = project_id,
+            dir = context_dir.display(),
+        )
+    }
+
+    fn close_active_agent(&mut self) {
+        let project_id = self.active_project().map(|p| p.id);
+        if let Some(state) = self.active_state() {
+            if let Some(i) = state.active_agent {
+                if i < state.agents.len() {
+                    state.agents.remove(i);
+                }
+                if state.agents.is_empty() {
+                    state.active_agent = None;
+                    state.view_mode = ViewMode::Editor;
+                } else {
+                    state.active_agent = Some(i.min(state.agents.len() - 1));
+                }
+            }
+        }
+        if let Some(id) = project_id {
+            self.persist_agent_sessions(id);
+        }
+    }
+
+    fn try_handle_terminal_prefix_global(&mut self, key: KeyEvent) -> Option<Result<()>> {
+        let result = match key.code {
+            KeyCode::Char('p') => self.open_picker(),
+            KeyCode::Char('f') => {
+                self.open_explorer_filter();
+                Ok(())
+            }
+            KeyCode::Char('g') => {
+                self.open_grep();
+                Ok(())
+            }
+            KeyCode::Char('e') => {
+                self.focus_tree();
+                Ok(())
+            }
+            KeyCode::Char('b') => {
+                self.focus_editor();
+                Ok(())
+            }
+            KeyCode::Char('c') => {
+                self.toggle_left_pane();
+                Ok(())
+            }
+            KeyCode::Char('C') => self.start_ai_commit(),
+            KeyCode::Char('w') => {
+                self.palette_show_working();
+                Ok(())
+            }
+            KeyCode::Char('t') => self.open_or_focus_terminal(),
+            KeyCode::Char('T') => self.new_terminal(),
+            KeyCode::Char('P') => self.open_project_view(),
+            KeyCode::Char('G') => self.open_git_view(),
+            KeyCode::Char('a') => self.agent_for_selected_feature(),
+            KeyCode::Char('z') => {
+                self.cycle_editor_wrap();
+                Ok(())
+            }
+            KeyCode::Char('?') => {
+                self.help_visible = true;
+                Ok(())
+            }
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    fn cycle_agent(&mut self, forward: bool) {
+        if let Some(state) = self.active_state() {
+            let n = state.agents.len();
+            if n == 0 {
+                return;
+            }
+            let cur = state.active_agent.unwrap_or(0);
+            let next = if forward {
+                (cur + 1) % n
+            } else {
+                (cur + n - 1) % n
+            };
+            state.active_agent = Some(next);
+        }
+    }
+
+    fn write_to_active_agent(&mut self, bytes: &[u8]) {
+        if let Some(state) = self.active_state() {
+            if let Some(i) = state.active_agent {
+                if let Some(agent) = state.agents.get_mut(i) {
+                    agent.reset_scrollback();
+                    agent.write_bytes(bytes);
+                }
+            }
+        }
+        self.capture_active_agent_session();
+    }
+
+    fn on_key_agents(&mut self, key: KeyEvent) -> Result<()> {
+        if self.terminal_prefix {
+            self.terminal_prefix = false;
+            match key.code {
+                KeyCode::Esc => return Ok(()),
+                KeyCode::Char('q') => {
+                    self.should_quit = true;
+                    return Ok(());
+                }
+                KeyCode::Char('d') => {
+                    if let Some(state) = self.active_state() {
+                        state.view_mode = ViewMode::Editor;
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char('n') => return self.new_agent(),
+                KeyCode::Char('l') => {
+                    self.cycle_agent(true);
+                    return Ok(());
+                }
+                KeyCode::Char('h') => {
+                    self.cycle_agent(false);
+                    return Ok(());
+                }
+                KeyCode::Char('x') => {
+                    self.close_active_agent();
+                    return Ok(());
+                }
+                KeyCode::Char(' ') => {
+                    self.write_to_active_agent(&[0]);
+                    return Ok(());
+                }
+                _ => {
+                    if let Some(r) = self.try_handle_terminal_prefix_global(key) {
+                        return r;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            self.write_to_active_agent(&[0x03]);
+            return Ok(());
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char(' ') => {
+                    self.terminal_prefix = true;
+                    return Ok(());
+                }
+                KeyCode::Char('l') => {
+                    self.cycle_agent(true);
+                    return Ok(());
+                }
+                KeyCode::Char('h') => {
+                    self.cycle_agent(false);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        if let Some(bytes) = crate::views::terminal::key_to_bytes(key) {
+            self.write_to_active_agent(&bytes);
+        }
+        Ok(())
+    }
+
     fn on_key_terminal(&mut self, key: KeyEvent) -> Result<()> {
         if self.terminal_prefix {
             self.terminal_prefix = false;
             match key.code {
                 KeyCode::Esc => return Ok(()),
+                KeyCode::Char('q') => {
+                    self.should_quit = true;
+                    return Ok(());
+                }
                 KeyCode::Char('d') => {
                     if let Some(state) = self.active_state() {
                         state.view_mode = ViewMode::Editor;
@@ -2224,7 +2889,12 @@ impl App {
                     self.write_to_active_terminal(&bytes);
                     return Ok(());
                 }
-                _ => return Ok(()),
+                _ => {
+                    if let Some(r) = self.try_handle_terminal_prefix_global(key) {
+                        return r;
+                    }
+                    return Ok(());
+                }
             }
         }
         if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
@@ -2442,7 +3112,8 @@ impl App {
     ) -> Result<()> {
         use crate::views::feature_form::FormFocus;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if ctrl && !alt {
             return self.handle_text_focus_ctrl_key(key, focus);
         }
         match key.code {
@@ -2498,6 +3169,11 @@ impl App {
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 if matches!(focus, FormFocus::Step(_) | FormFocus::Comment(_)) {
                     self.with_feature_form(|f| f.delete_focused());
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                if matches!(focus, FormFocus::Comment(_)) {
+                    self.with_feature_form(|f| f.cycle_comment_kind());
                 }
             }
             _ => {}
@@ -2736,11 +3412,15 @@ impl App {
         for comment in &form.comments {
             match comment.id {
                 Some(id) if comment.deleted => self.db.delete_comment(id)?,
-                Some(id) => self
-                    .db
-                    .update_comment(id, &comment.message, comment.status)?,
+                Some(id) => {
+                    self.db
+                        .update_comment(id, &comment.message, comment.status)?;
+                    self.db.update_comment_kind(id, comment.kind)?;
+                }
                 None if !comment.deleted && !comment.message.trim().is_empty() => {
-                    let new_id = self.db.insert_comment(feature_id, &comment.message)?;
+                    let new_id = self
+                        .db
+                        .insert_comment_with_kind(feature_id, &comment.message, comment.kind)?;
                     if comment.status != crate::project::CommentStatus::Queued {
                         self.db
                             .update_comment(new_id, &comment.message, comment.status)?;
@@ -2830,36 +3510,63 @@ impl App {
 
     fn project_delete_selected(&mut self) -> Result<()> {
         use crate::views::project_view::ProjectSelection;
-        let id = {
+        let target = {
             let Some(state) = self.active_state() else { return Ok(()) };
             let Some(model) = state.project_view.as_mut() else { return Ok(()) };
             match model.selection {
-                ProjectSelection::Feature(i) => model.features.get(i).map(|f| f.id),
+                ProjectSelection::Feature(i) => model
+                    .features
+                    .get(i)
+                    .map(|f| (f.id, f.title.clone())),
                 _ => None,
             }
         };
-        if let Some(id) = id {
-            self.db.delete_feature(id)?;
-            self.reload_project_view()?;
+        if let Some((id, title)) = target {
+            self.pending_delete_feature = Some((id, title));
+            self.mode = AppMode::ConfirmDeleteFeature;
         }
         Ok(())
+    }
+
+    fn confirm_delete_feature(&mut self) -> Result<()> {
+        if let Some((id, _)) = self.pending_delete_feature.take() {
+            self.db.delete_feature(id)?;
+            self.reload_project_view()?;
+            self.status = "Feature deleted".into();
+        }
+        self.mode = AppMode::Normal;
+        Ok(())
+    }
+
+    fn cancel_delete_feature(&mut self) {
+        self.pending_delete_feature = None;
+        self.mode = AppMode::Normal;
+        self.status = "Delete cancelled".into();
     }
 
     fn reload_project_view(&mut self) -> Result<()> {
         let Some(project) = self.active_project().cloned() else { return Ok(()) };
         let meta = self.db.load_project_meta(project.id)?;
         let features = self.db.list_features(project.id)?;
+        let has_agents = self
+            .active_state_ref()
+            .map(|s| !s.agents.is_empty())
+            .unwrap_or(false);
         if let Some(state) = self.active_state() {
             if let Some(model) = state.project_view.as_mut() {
                 let prev_sel = model.list_state.selected();
-                model.meta = meta;
-                model.features = features;
+                model.meta = meta.clone();
+                model.features = features.clone();
                 let total = model.rows();
                 if let Some(idx) = prev_sel {
                     model.list_state.select(Some(idx.min(total.saturating_sub(1))));
                 }
                 model.sync_selection_from_list();
             }
+        }
+        if has_agents {
+            let dir = self.paths.project_context_dir(project.id);
+            let _ = Self::write_context_files(&dir, &project.name, &meta, &features);
         }
         Ok(())
     }
@@ -2868,6 +3575,7 @@ impl App {
         if let Some(state) = self.active_state() {
             if let Some(i) = state.active_terminal {
                 if let Some(term) = state.terminals.get_mut(i) {
+                    term.reset_scrollback();
                     term.write_bytes(bytes);
                 }
             }
@@ -3044,6 +3752,15 @@ fn format_range(part: &str, sign: char) -> String {
     } else {
         let end = start_n + count.saturating_sub(1);
         format!("{} L{}-{}", sign, start_n, end)
+    }
+}
+
+fn git_first_line(text: &str, fallback: &str) -> String {
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    if first.is_empty() {
+        fallback.to_string()
+    } else {
+        first.to_string()
     }
 }
 

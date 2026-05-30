@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -8,6 +8,7 @@ pub const LARGE_FILE_LINE_THRESHOLD: usize = 10_000;
 pub struct Paths {
     pub db_file: PathBuf,
     pub settings_file: PathBuf,
+    pub data_dir: PathBuf,
 }
 
 impl Paths {
@@ -20,8 +21,28 @@ impl Paths {
         Ok(Self {
             db_file: data_dir.join("coffeetable.db"),
             settings_file: data_dir.join("settings.yaml"),
+            data_dir,
         })
     }
+
+    pub fn project_context_dir(&self, project_id: i64) -> PathBuf {
+        self.data_dir
+            .join("agents")
+            .join(format!("project_{}", project_id))
+    }
+
+}
+
+pub fn claude_projects_dir(cwd: &Path) -> Option<PathBuf> {
+    let base = BaseDirs::new()?;
+    Some(base.home_dir().join(".claude").join("projects").join(encode_cwd(cwd)))
+}
+
+fn encode_cwd(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|c| if c == ':' || c == '\\' || c == '/' { '-' } else { c })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-use crate::project::{CommentStatus, Feature, FeatureStatus, StepStatus};
+use crate::project::{CommentKind, CommentStatus, Feature, FeatureStatus, StepStatus};
 use crate::views::editor::EditorView;
 use anyhow::Result;
 
@@ -33,6 +33,7 @@ pub struct CommentDraft {
     pub id: Option<i64>,
     pub message: String,
     pub status: CommentStatus,
+    pub kind: CommentKind,
     pub deleted: bool,
 }
 
@@ -97,6 +98,7 @@ impl FeatureForm {
                     id: Some(c.id),
                     message: c.message.clone(),
                     status: c.status,
+                    kind: c.kind,
                     deleted: false,
                 })
                 .collect(),
@@ -265,10 +267,20 @@ impl FeatureForm {
             id: None,
             message: trimmed,
             status: CommentStatus::Queued,
+            kind: CommentKind::Note,
             deleted: false,
         });
         self.dirty = true;
         Some(self.comments.len() - 1)
+    }
+
+    pub fn cycle_comment_kind(&mut self) {
+        if let FormFocus::Comment(i) = self.focus {
+            if let Some(c) = self.comments.get_mut(i) {
+                c.kind = c.kind.cycle();
+                self.dirty = true;
+            }
+        }
     }
 
     fn first_visible_step(&self) -> Option<usize> {
@@ -396,6 +408,9 @@ impl FeatureForm {
             }
             FormFocus::NewComment => {
                 let _ = self.commit_new_comment();
+            }
+            FormFocus::Description => {
+                self.commit_description_editor();
             }
             _ => {}
         }

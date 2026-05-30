@@ -1,6 +1,6 @@
 use crate::project::{
-    Feature, FeatureComment, FeatureStatus, FeatureStep, FileTreeState, Project, ProjectMeta,
-    StepStatus, CommentStatus,
+    CommentKind, CommentStatus, Feature, FeatureComment, FeatureStatus, FeatureStep, FileTreeState,
+    Project, ProjectMeta, StepStatus,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -61,14 +61,39 @@ CREATE TABLE IF NOT EXISTS feature_comments (
     feature_id INTEGER NOT NULL,
     message TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
+    kind TEXT NOT NULL DEFAULT 'note',
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     FOREIGN KEY (feature_id) REFERENCES features(id) ON DELETE CASCADE
 );
 "#;
 
+fn migrate(conn: &Connection) -> Result<()> {
+    let needs_kind: bool = {
+        let mut stmt = conn.prepare("PRAGMA table_info(feature_comments)")?;
+        let mut found = false;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let name: String = r.get(1)?;
+            if name == "kind" {
+                found = true;
+                break;
+            }
+        }
+        !found
+    };
+    if needs_kind {
+        conn.execute(
+            "ALTER TABLE feature_comments ADD COLUMN kind TEXT NOT NULL DEFAULT 'note'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 const KEY_FILE_TREE: &str = "file_tree";
 const KEY_OPEN_PROJECTS: &str = "open_projects";
 const KEY_ACTIVE_PROJECT: &str = "active_project";
+const KEY_AGENT_SESSIONS: &str = "agent_sessions";
 
 pub struct Db {
     conn: Connection,
@@ -80,6 +105,8 @@ impl Db {
             .with_context(|| format!("could not open db at {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("could not init schema")?;
         conn.execute("PRAGMA foreign_keys = ON", [])?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        migrate(&conn).context("could not migrate schema")?;
         Ok(Self { conn })
     }
 
@@ -195,6 +222,30 @@ impl Db {
         Ok(())
     }
 
+    pub fn load_agent_sessions(&self, project_id: i64) -> Result<Vec<String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM project_state WHERE project_id = ?1 AND key = ?2",
+                params![project_id, KEY_AGENT_SESSIONS],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn save_agent_sessions(&self, project_id: i64, sessions: &[String]) -> Result<()> {
+        let json = serde_json::to_string(sessions)?;
+        self.conn.execute(
+            "INSERT INTO project_state (project_id, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id, key) DO UPDATE SET value = excluded.value",
+            params![project_id, KEY_AGENT_SESSIONS, json],
+        )?;
+        Ok(())
+    }
+
     pub fn load_project_meta(&self, project_id: i64) -> Result<ProjectMeta> {
         let row: Option<(String, String, String, String)> = self
             .conn
@@ -293,6 +344,14 @@ impl Db {
         Ok(())
     }
 
+    pub fn update_feature_status(&self, feature_id: i64, status: FeatureStatus) -> Result<()> {
+        self.conn.execute(
+            "UPDATE features SET status = ?1 WHERE id = ?2",
+            params![status.as_str(), feature_id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_feature(&self, feature_id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM features WHERE id = ?1", params![feature_id])?;
@@ -352,7 +411,7 @@ impl Db {
 
     pub fn list_comments(&self, feature_id: i64) -> Result<Vec<FeatureComment>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, message, status, created_at FROM feature_comments
+            "SELECT id, message, status, kind, created_at FROM feature_comments
              WHERE feature_id = ?1 ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map(params![feature_id], |r| {
@@ -361,7 +420,8 @@ impl Db {
                 feature_id,
                 message: r.get(1)?,
                 status: CommentStatus::from_str(&r.get::<_, String>(2)?),
-                created_at: r.get(3)?,
+                kind: CommentKind::from_str(&r.get::<_, String>(3)?),
+                created_at: r.get(4)?,
             })
         })?;
         let mut out = Vec::new();
@@ -371,10 +431,15 @@ impl Db {
         Ok(out)
     }
 
-    pub fn insert_comment(&self, feature_id: i64, message: &str) -> Result<i64> {
+    pub fn insert_comment_with_kind(
+        &self,
+        feature_id: i64,
+        message: &str,
+        kind: CommentKind,
+    ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO feature_comments (feature_id, message) VALUES (?1, ?2)",
-            params![feature_id, message],
+            "INSERT INTO feature_comments (feature_id, message, kind) VALUES (?1, ?2, ?3)",
+            params![feature_id, message, kind.as_str()],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -383,6 +448,14 @@ impl Db {
         self.conn.execute(
             "UPDATE feature_comments SET message = ?1, status = ?2 WHERE id = ?3",
             params![message, status.as_str(), comment_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_comment_kind(&self, comment_id: i64, kind: CommentKind) -> Result<()> {
+        self.conn.execute(
+            "UPDATE feature_comments SET kind = ?1 WHERE id = ?2",
+            params![kind.as_str(), comment_id],
         )?;
         Ok(())
     }

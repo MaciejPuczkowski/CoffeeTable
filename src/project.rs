@@ -169,6 +169,44 @@ impl CommentStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentKind {
+    Note,
+    Request,
+    Response,
+}
+
+impl CommentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommentKind::Note => "note",
+            CommentKind::Request => "request",
+            CommentKind::Response => "response",
+        }
+    }
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "request" => CommentKind::Request,
+            "response" => CommentKind::Response,
+            _ => CommentKind::Note,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            CommentKind::Note => "note",
+            CommentKind::Request => "request",
+            CommentKind::Response => "response",
+        }
+    }
+    pub fn cycle(self) -> Self {
+        match self {
+            CommentKind::Note => CommentKind::Request,
+            CommentKind::Request => CommentKind::Response,
+            CommentKind::Response => CommentKind::Note,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Feature {
@@ -199,5 +237,6 @@ pub struct FeatureComment {
     pub feature_id: i64,
     pub message: String,
     pub status: CommentStatus,
+    pub kind: CommentKind,
     pub created_at: i64,
 }

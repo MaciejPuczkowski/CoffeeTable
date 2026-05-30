@@ -39,7 +39,9 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         .unwrap_or(crate::app::ViewMode::Editor);
     match view_mode {
         crate::app::ViewMode::Terminal => render_terminal_body(app, frame, chunks[2]),
+        crate::app::ViewMode::Agents => render_agents_body(app, frame, chunks[2]),
         crate::app::ViewMode::Project => render_project_body(app, frame, chunks[2]),
+        crate::app::ViewMode::Git => render_git_body(app, frame, chunks[2]),
         crate::app::ViewMode::Editor => render_body(app, frame, chunks[2]),
     }
     render_command_or_status(app, frame, chunks[3]);
@@ -49,6 +51,7 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         AppMode::Picker => render_picker_overlay(app, frame, area),
         AppMode::Grep => render_grep_overlay(app, frame, area),
         AppMode::OpenConfirm => render_open_confirm_overlay(app, frame, area),
+        AppMode::ConfirmDeleteFeature => render_delete_feature_overlay(app, frame, area),
         AppMode::Palette => render_command_palette_overlay(app, frame, area),
         AppMode::AiCommit => render_ai_commit_overlay(app, frame, area),
         AppMode::Normal | AppMode::ExplorerFilter => {}
@@ -147,11 +150,27 @@ fn render_command_palette_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) 
 fn render_terminal_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
     let entries: &[(&str, &str)] = &[
         ("d", "Detach (back to Editor view)"),
-        ("n", "New terminal in this project"),
-        ("l", "Next terminal"),
-        ("h", "Previous terminal"),
-        ("x", "Close current terminal"),
-        ("Space", "Send literal Ctrl+Space to the shell"),
+        ("n", "New tab in this view"),
+        ("l", "Next tab"),
+        ("h", "Previous tab"),
+        ("x", "Close current tab"),
+        ("Space", "Send literal Ctrl+Space"),
+        ("p", "Projects (picker)"),
+        ("f", "Find file"),
+        ("g", "Grep"),
+        ("c", "Changes ↔ tree (toggle)"),
+        ("e", "Explorer (focus tree)"),
+        ("b", "Buffer (focus editor)"),
+        ("w", "Show Working copy (editor)"),
+        ("C", "AI commit"),
+        ("t", "Terminal (focus or create)"),
+        ("T", "New terminal"),
+        ("P", "Project view"),
+        ("G", "Git view (branches + commits)"),
+        ("a", "Agent for selected feature"),
+        ("z", "Toggle wrap (none / 120 / 80)"),
+        ("?", "Help"),
+        ("q", "Quit"),
         ("Esc", "Cancel prefix"),
     ];
     let popup_height = entries.len() as u16 + 4;
@@ -199,6 +218,9 @@ fn render_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
         ("t", "Terminal (focus existing or create first)"),
         ("T", "New terminal (always create)"),
         ("P", "Project view (meta + features)"),
+        ("G", "Git view (branches + commits)"),
+        ("a", "Agent for selected feature"),
+        ("z", "Toggle wrap (none / 120 / 80)"),
         ("?", "Help"),
         ("q", "Quit"),
     ];
@@ -255,7 +277,9 @@ fn render_view_tabs(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     for (mode, label) in &[
         (crate::app::ViewMode::Editor, "Editor"),
         (crate::app::ViewMode::Terminal, "Terminal"),
+        (crate::app::ViewMode::Agents, "Agents"),
         (crate::app::ViewMode::Project, "Project"),
+        (crate::app::ViewMode::Git, "Git"),
     ] {
         let text = format!(" {} ", label);
         let w = text.chars().count() as u16;
@@ -515,7 +539,7 @@ fn render_project_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
                 }
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    "  Comments",
+                    "  Messages",
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::BOLD),
@@ -555,6 +579,202 @@ fn render_project_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     ];
     lines.extend(hints);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_git_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
+    use crate::views::git::{DetailsMode, GitPane};
+    use ratatui::widgets::{List, ListItem, StatefulWidget, ListState};
+
+    let Some(project) = app.open_projects.get(app.active_index).cloned() else {
+        return;
+    };
+    let needs_load = app
+        .project_views
+        .get(&project.id)
+        .map(|s| s.git_view.is_none())
+        .unwrap_or(false);
+    if needs_load {
+        app.ensure_git_view_loaded();
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(35), Constraint::Min(20)])
+        .split(area);
+    app.left_pane_area = chunks[0];
+    app.right_pane_area = chunks[1];
+
+    let left_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(40), Constraint::Min(3)])
+        .split(chunks[0]);
+
+    let Some(state) = app.project_views.get_mut(&project.id) else {
+        return;
+    };
+    let Some(view) = state.git_view.as_mut() else {
+        let p = Paragraph::new("Git view unavailable.")
+            .block(Block::default().borders(Borders::ALL).title(" Git "));
+        frame.render_widget(p, area);
+        return;
+    };
+    view.branches_area = left_split[0];
+    view.commits_area = left_split[1];
+    view.details_area = chunks[1];
+
+    let branches_focused = matches!(view.focus, GitPane::Branches);
+    let commits_focused = matches!(view.focus, GitPane::Commits);
+    let details_focused = matches!(view.focus, GitPane::Details);
+
+    let cur_label = view
+        .current_branch
+        .clone()
+        .unwrap_or_else(|| "(detached)".into());
+    let branch_title = format!(" Branches — on {} ", cur_label);
+    let mut branch_items: Vec<ListItem> = Vec::with_capacity(view.branches.len());
+    for b in &view.branches {
+        let marker = if b.is_current { "● " } else { "  " };
+        let mut spans: Vec<Span> = Vec::new();
+        let marker_color = if b.is_current { Color::Green } else { Color::DarkGray };
+        spans.push(Span::styled(marker, Style::default().fg(marker_color)));
+        let name_style = if b.is_remote {
+            Style::default().fg(Color::Cyan)
+        } else if b.is_current {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(b.name.clone(), name_style));
+        if let Some(up) = &b.upstream {
+            spans.push(Span::styled(
+                format!("  ↑ {}", up),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        branch_items.push(ListItem::new(Line::from(spans)));
+    }
+    if branch_items.is_empty() {
+        branch_items.push(ListItem::new(Line::from(Span::styled(
+            "  (no branches — not a git repo?)",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+    let branches_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border(branches_focused))
+        .title(branch_title);
+    let mut branch_state = ListState::default();
+    branch_state.select(Some(view.branch_idx));
+    let branches_list = List::new(branch_items)
+        .block(branches_block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    StatefulWidget::render(branches_list, left_split[0], frame.buffer_mut(), &mut branch_state);
+
+    let commits_title = match view.selected_branch() {
+        Some(b) => format!(" Commits — {} ", b.name),
+        None => " Commits ".to_string(),
+    };
+    let mut commit_items: Vec<ListItem> = Vec::with_capacity(view.commits.len());
+    for c in &view.commits {
+        commit_items.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                format!("{} ", c.short_sha),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!("{} ", c.date),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(c.summary.clone()),
+            Span::styled(
+                format!("  ({})", c.author),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])));
+    }
+    if commit_items.is_empty() {
+        commit_items.push(ListItem::new(Line::from(Span::styled(
+            "  (no commits)",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+    let commits_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border(commits_focused))
+        .title(commits_title);
+    let mut commit_state = ListState::default();
+    commit_state.select(Some(view.commit_idx));
+    let commits_list = List::new(commit_items)
+        .block(commits_block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    StatefulWidget::render(commits_list, left_split[1], frame.buffer_mut(), &mut commit_state);
+
+    let title_prefix = match view.details_mode {
+        DetailsMode::Commit => "",
+        DetailsMode::PrList => "[PRs] ",
+        DetailsMode::PrView => "[PR] ",
+    };
+    let details_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border(details_focused))
+        .title(format!(" {}{} ", title_prefix, view.details_title));
+    let inner = details_block.inner(chunks[1]);
+    frame.render_widget(details_block, chunks[1]);
+    let lines: Vec<Line> = view
+        .details_text
+        .lines()
+        .map(|l| Line::from(diff_line_style(l)))
+        .collect();
+    let para = Paragraph::new(lines).scroll((view.details_scroll, 0));
+    frame.render_widget(para, inner);
+}
+
+fn pane_border(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn diff_line_style(line: &str) -> Vec<Span<'static>> {
+    let owned = line.to_string();
+    if owned.starts_with("+++") || owned.starts_with("---") {
+        vec![Span::styled(owned, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]
+    } else if owned.starts_with("@@") {
+        vec![Span::styled(owned, Style::default().fg(Color::Magenta))]
+    } else if owned.starts_with('+') {
+        vec![Span::styled(owned, Style::default().fg(Color::Green))]
+    } else if owned.starts_with('-') {
+        vec![Span::styled(owned, Style::default().fg(Color::Red))]
+    } else if owned.starts_with("commit ") {
+        vec![Span::styled(owned, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]
+    } else if owned.starts_with("Author:") || owned.starts_with("Date:") {
+        vec![Span::styled(owned, Style::default().fg(Color::DarkGray))]
+    } else {
+        vec![Span::raw(owned)]
+    }
+}
+
+fn comment_kind_glyph(kind: crate::project::CommentKind) -> &'static str {
+    use crate::project::CommentKind;
+    match kind {
+        CommentKind::Note => "◦",
+        CommentKind::Request => "▶",
+        CommentKind::Response => "◀",
+    }
 }
 
 fn feature_status_color(status: crate::project::FeatureStatus) -> Color {
@@ -660,7 +880,7 @@ fn render_form_tabs(
         (FormPage::Details, " 1·Details ".to_string()),
         (
             FormPage::Comments,
-            format!(" 2·Comments ({}) ", visible_comments),
+            format!(" 2·Messages ({}) ", visible_comments),
         ),
     ];
     let mut spans: Vec<Span> = Vec::new();
@@ -926,7 +1146,7 @@ fn render_form_comments(
 ) -> Vec<(crate::views::feature_form::FormFocus, Rect)> {
     use crate::project::CommentStatus;
     use crate::views::feature_form::FormFocus;
-    let block = field_block("Comments (Ctrl+T cycle • Ctrl+D delete)", focused);
+    let block = field_block("Messages (Ctrl+T status • Ctrl+K kind • Ctrl+D delete)", focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -952,7 +1172,12 @@ fn render_form_comments(
             CommentStatus::Sent => Style::default().fg(Color::Cyan),
             CommentStatus::Done => Style::default().fg(Color::Green),
         };
-        let head = format!("{}[{}] ", prefix, comment.status.label());
+        let head = format!(
+            "{}{} [{}] ",
+            prefix,
+            comment_kind_glyph(comment.kind),
+            comment.status.label()
+        );
         let head_w = head.chars().count() as u16;
         let line_area = Rect {
             x: inner.x,
@@ -1157,6 +1382,83 @@ fn render_terminal_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     if let Some(term) = state.terminals.get_mut(active) {
         let widget = crate::views::terminal::TerminalWidget {
             view: term,
+            focused: true,
+        };
+        frame.render_widget(widget, inner);
+    }
+}
+
+fn render_agents_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(project) = app.open_projects.get(app.active_index).cloned() else {
+        return;
+    };
+    app.agent_tab_rects.clear();
+    app.agent_new_rect = None;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(area);
+    app.agent_tabs_area = chunks[0];
+
+    let Some(state) = app.project_views.get_mut(&project.id) else {
+        return;
+    };
+    let total = state.agents.len();
+    let active = state.active_agent.unwrap_or(0);
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = chunks[0].x + 1;
+    for (i, agent) in state.agents.iter().enumerate() {
+        let text = format!(" {} ", agent.name);
+        let w = text.chars().count() as u16;
+        let style = if i == active {
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        app.agent_tab_rects
+            .push(Rect::new(x, chunks[0].y, w, 1));
+        spans.push(Span::styled(text, style));
+        x += w;
+        spans.push(Span::raw(" "));
+        x += 1;
+    }
+    let plus = " + ".to_string();
+    let plus_w = plus.chars().count() as u16;
+    let plus_rect = Rect::new(x, chunks[0].y, plus_w, 1);
+    app.agent_new_rect = Some(plus_rect);
+    spans.push(Span::styled(
+        plus,
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+
+    let body_area = chunks[1];
+    let header_text = if total == 0 {
+        format!(" Agents — {} (no agent) ", project.name)
+    } else {
+        format!(" Agents — {} ", project.name)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(header_text);
+    let inner = block.inner(body_area);
+    frame.render_widget(block, body_area);
+
+    if total == 0 || active >= total {
+        let para = Paragraph::new("No agent — Ctrl+Space then n to start one")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(para, inner);
+        return;
+    }
+    if let Some(agent) = state.agents.get_mut(active) {
+        let widget = crate::views::agents::AgentWidget {
+            session: agent,
             focused: true,
         };
         frame.render_widget(widget, inner);
@@ -1476,6 +1778,9 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 "j/k Tab move • i/Enter edit field • x cycle status • d cycle step • D delete • Ctrl+S save • Esc back • ? help"
                     .to_string()
             }
+            Some(crate::app::ViewMode::Git) => {
+                "j/k move • Tab pane • Enter open • c checkout • p push • P pull • m merge • R PR • V PRs • r refresh • ? help".to_string()
+            }
             Some(crate::app::ViewMode::Terminal) => {
                 "Ctrl+Space leader • Ctrl+L/H switch • Ctrl+Shift+C SIGINT • Ctrl+J/K view • ? help".to_string()
             }
@@ -1492,6 +1797,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         AppMode::Picker => "? help  •  Esc close".into(),
         AppMode::Grep => "Type to filter  •  Enter open  •  Esc cancel".into(),
         AppMode::OpenConfirm => "y / Enter open  •  n / Esc cancel".into(),
+        AppMode::ConfirmDeleteFeature => "y / Enter delete  •  n / Esc cancel".into(),
         AppMode::Palette => "↑/↓ select  •  Enter run  •  ! suffix forces  •  Esc cancel".into(),
         AppMode::ExplorerFilter => "Type to narrow  •  ↑/↓ select  •  Enter open  •  Esc clear+exit".into(),
         AppMode::AiCommit => {
@@ -1699,6 +2005,55 @@ fn render_ai_commit_overlay(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
+fn render_delete_feature_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let Some((_, title)) = app.pending_delete_feature.as_ref() else { return };
+    let popup = centered_rect_fixed(70, 9, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Delete feature? ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Are you sure you want to delete "),
+            Span::styled(
+                format!("\"{}\"", title),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("?"),
+        ]),
+        Line::from(Span::styled(
+            "  This will also delete its steps and comments.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "y / Enter",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  delete     "),
+            Span::styled(
+                "n / Esc",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  cancel"),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_open_confirm_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let Some(pending) = app.pending_open.as_ref() else { return };
     let popup = centered_rect_fixed(70, 9, area);
@@ -1863,6 +2218,13 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                 ("n / Esc", "cancel"),
             ],
         ),
+        AppMode::ConfirmDeleteFeature => (
+            "Delete feature",
+            vec![
+                ("y / Enter", "delete"),
+                ("n / Esc", "cancel"),
+            ],
+        ),
         AppMode::AiCommit => (
             "AI commit",
             vec![
@@ -1899,6 +2261,32 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                 .and_then(|p| app.project_views.get(&p.id))
                 .map(|s| matches!(s.view_mode, crate::app::ViewMode::Project))
                 .unwrap_or(false);
+            let in_git = app
+                .open_projects
+                .get(app.active_index)
+                .and_then(|p| app.project_views.get(&p.id))
+                .map(|s| matches!(s.view_mode, crate::app::ViewMode::Git))
+                .unwrap_or(false);
+            if in_git {
+                return (
+                    "Git",
+                    vec![
+                        ("j/k  ↓/↑", "navigate within focused pane"),
+                        ("Tab / Shift+Tab", "cycle panes (branches → commits → details)"),
+                        ("Enter / l", "drill into selection (branch, commit, PR)"),
+                        ("Esc / Backspace", "in PR view: back to PR list / back to commit"),
+                        ("g / G", "jump to top / bottom of focused pane"),
+                        ("c", "checkout selected branch"),
+                        ("p", "push current branch (auto sets upstream)"),
+                        ("P", "pull (ff-only) into current branch"),
+                        ("m", "merge selected branch into current"),
+                        ("R", "create a PR for the current branch (gh)"),
+                        ("V", "list PRs for selected branch (gh)"),
+                        ("r", "refresh branches + commits"),
+                        ("Ctrl+J / Ctrl+K", "switch view"),
+                    ],
+                );
+            }
             if in_project {
                 return (
                     "Project",
