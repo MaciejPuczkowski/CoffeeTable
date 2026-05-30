@@ -32,6 +32,7 @@ fn main() -> Result<()> {
     let paths = Paths::resolve()?;
     let db = Db::open(&paths.db_file)?;
     let mut app = App::new(db, paths)?;
+    app.restore_all_agents()?;
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app);

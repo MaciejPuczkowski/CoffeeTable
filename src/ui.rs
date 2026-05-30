@@ -37,12 +37,13 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         .and_then(|p| app.project_views.get(&p.id))
         .map(|s| s.view_mode)
         .unwrap_or(crate::app::ViewMode::Editor);
+    let body_area = split_off_agent_lane(app, frame, chunks[2]);
     match view_mode {
-        crate::app::ViewMode::Terminal => render_terminal_body(app, frame, chunks[2]),
-        crate::app::ViewMode::Agents => render_agents_body(app, frame, chunks[2]),
-        crate::app::ViewMode::Project => render_project_body(app, frame, chunks[2]),
-        crate::app::ViewMode::Git => render_git_body(app, frame, chunks[2]),
-        crate::app::ViewMode::Editor => render_body(app, frame, chunks[2]),
+        crate::app::ViewMode::Terminal => render_terminal_body(app, frame, body_area),
+        crate::app::ViewMode::Agents => render_agents_body(app, frame, body_area),
+        crate::app::ViewMode::Project => render_project_body(app, frame, body_area),
+        crate::app::ViewMode::Git => render_git_body(app, frame, body_area),
+        crate::app::ViewMode::Editor => render_body(app, frame, body_area),
     }
     render_command_or_status(app, frame, chunks[3]);
     render_footer(app, frame, chunks[4]);
@@ -168,6 +169,7 @@ fn render_terminal_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
         ("P", "Project view"),
         ("G", "Git view (branches + commits)"),
         ("a", "Agent for selected feature"),
+        ("L", "Toggle Agents lane (right side)"),
         ("z", "Toggle wrap (none / 120 / 80)"),
         ("?", "Help"),
         ("q", "Quit"),
@@ -220,6 +222,7 @@ fn render_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
         ("P", "Project view (meta + features)"),
         ("G", "Git view (branches + commits)"),
         ("a", "Agent for selected feature"),
+        ("L", "Toggle Agents lane (right side)"),
         ("z", "Toggle wrap (none / 120 / 80)"),
         ("?", "Help"),
         ("q", "Quit"),
@@ -1139,14 +1142,35 @@ fn render_form_steps(
 }
 
 fn render_form_comments(
-    form: &crate::views::feature_form::FeatureForm,
+    form: &mut crate::views::feature_form::FeatureForm,
     area: Rect,
     frame: &mut Frame<'_>,
     focused: bool,
 ) -> Vec<(crate::views::feature_form::FormFocus, Rect)> {
     use crate::project::CommentStatus;
-    use crate::views::feature_form::FormFocus;
-    let block = field_block("Messages (Ctrl+T status • Ctrl+K kind • Ctrl+D delete)", focused);
+    use crate::views::feature_form::{EditorTarget, FormFocus};
+    if focused && form.message_editing() {
+        let target = form.editor_target();
+        if let (Some(editor), Some(target)) = (form.editor.as_mut(), target) {
+            editor.focused = true;
+            let title = match target {
+                EditorTarget::NewComment => "New message (Esc/Backspace to commit)".to_string(),
+                _ => "Message (Esc/Backspace to commit)".to_string(),
+            };
+            let widget = crate::views::editor::EditorWidget {
+                view: editor,
+                area_title: title,
+                git_status: None,
+            };
+            frame.render_widget(widget, area);
+            let rect = match target {
+                EditorTarget::Comment(i) => (FormFocus::Comment(i), area),
+                _ => (FormFocus::NewComment, area),
+            };
+            return vec![rect];
+        }
+    }
+    let block = field_block("Messages (i/Enter to edit • Ctrl+T status • Ctrl+K kind • Ctrl+D delete)", focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1309,6 +1333,185 @@ fn field_block(title: &str, focused: bool) -> Block<'_> {
         .borders(Borders::ALL)
         .border_style(style)
         .title(format!(" {} ", title))
+}
+
+fn split_off_agent_lane(app: &mut App, frame: &mut Frame<'_>, area: Rect) -> Rect {
+    if !app.agent_lane_visible || area.width < 36 {
+        app.agent_lane_area = Rect::default();
+        app.agent_lane_tile_rects.clear();
+        return area;
+    }
+    let lane_width: u16 = 36u16.min(area.width / 3).max(28);
+    let split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(24), Constraint::Length(lane_width)])
+        .split(area);
+    render_agent_lane(app, frame, split[1]);
+    split[0]
+}
+
+const LANE_TILE_LINES: u16 = 3;
+const LANE_TILE_GAP: u16 = 1;
+
+fn render_agent_lane(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
+    use crate::views::agents::LaneStatus;
+    app.agent_lane_area = area;
+    app.agent_lane_tile_rects.clear();
+
+    let total_agents: usize = app
+        .project_views
+        .values()
+        .map(|s| s.agents.len())
+        .sum();
+    let title = if total_agents == 0 {
+        " Lane ".to_string()
+    } else {
+        format!(" Lane ({}) ", total_agents)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if total_agents == 0 {
+        let p = Paragraph::new(Line::from(vec![Span::styled(
+            " (no active agents)",
+            Style::default().fg(Color::DarkGray),
+        )]));
+        frame.render_widget(p, inner);
+        return;
+    }
+
+    let active_pid = app.open_projects.get(app.active_index).map(|p| p.id);
+    let active_view_mode = app
+        .open_projects
+        .get(app.active_index)
+        .and_then(|p| app.project_views.get(&p.id))
+        .map(|s| s.view_mode);
+    let active_agent_idx = app
+        .open_projects
+        .get(app.active_index)
+        .and_then(|p| app.project_views.get(&p.id))
+        .and_then(|s| s.active_agent);
+
+    let mut y = inner.y;
+    let max_y = inner.y + inner.height;
+    let projects_snapshot: Vec<(i64, String)> = app
+        .open_projects
+        .iter()
+        .map(|p| (p.id, p.name.clone()))
+        .collect();
+    let inner_w = inner.width as usize;
+    let text_w = inner_w.saturating_sub(3);
+
+    for (pid, pname) in projects_snapshot {
+        let Some(state) = app.project_views.get(&pid) else { continue };
+        if state.agents.is_empty() {
+            continue;
+        }
+        for (idx, agent) in state.agents.iter().enumerate() {
+            if y + LANE_TILE_LINES > max_y {
+                break;
+            }
+            let is_active = active_pid == Some(pid)
+                && active_view_mode == Some(crate::app::ViewMode::Agents)
+                && active_agent_idx == Some(idx);
+            let status = agent.lane_status();
+            let attention = agent.bells_pending > 0;
+            let (state_icon, state_color, state_label) = match (attention, status) {
+                (true, _) => ("!", Color::Yellow, "Attention"),
+                (false, LaneStatus::Working) => ("●", Color::Green, "Working"),
+                (false, LaneStatus::Idle) => ("○", Color::DarkGray, "Idle"),
+            };
+            let marker = if is_active { "▶ " } else { "  " };
+            let row_style = if is_active {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+
+            let tile_rect = Rect::new(inner.x, y, inner.width, LANE_TILE_LINES);
+
+            // Line 1: project name (with marker)
+            let project_line = Rect::new(inner.x, y, inner.width, 1);
+            let proj_text = truncate_with_ellipsis(&pname, text_w);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(marker, Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        proj_text,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]))
+                .style(row_style),
+                project_line,
+            );
+
+            // Line 2: agent title (indented, truncated if needed)
+            let title_line = Rect::new(inner.x, y + 1, inner.width, 1);
+            let agent_text = truncate_with_ellipsis(&agent.name, text_w);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(agent_text),
+                ]))
+                .style(row_style),
+                title_line,
+            );
+
+            // Line 3: state · age
+            let status_line = Rect::new(inner.x, y + 2, inner.width, 1);
+            let age = agent.activity_age_label();
+            let mut spans: Vec<Span> = vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{} ", state_icon),
+                    Style::default().fg(state_color),
+                ),
+                Span::styled(
+                    state_label.to_string(),
+                    Style::default().fg(state_color),
+                ),
+                Span::styled(
+                    format!(" · {}", age),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+            if attention && agent.bells_pending > 1 {
+                spans.push(Span::styled(
+                    format!(" ({}×)", agent.bells_pending),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).style(row_style),
+                status_line,
+            );
+
+            app.agent_lane_tile_rects.push((pid, idx, tile_rect));
+            y += LANE_TILE_LINES + LANE_TILE_GAP;
+        }
+    }
+}
+
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = chars[..max - 1].iter().collect();
+    out.push('…');
+    out
 }
 
 fn render_terminal_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {

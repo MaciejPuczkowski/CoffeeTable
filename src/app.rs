@@ -159,6 +159,9 @@ pub struct App {
     pub feature_form_tab_rects: Vec<(crate::views::feature_form::FormPage, Rect)>,
     pub feature_form_field_rects: Vec<(crate::views::feature_form::FormFocus, Rect)>,
     pub feature_form_status_rects: Vec<(crate::project::FeatureStatus, Rect)>,
+    pub agent_lane_visible: bool,
+    pub agent_lane_area: Rect,
+    pub agent_lane_tile_rects: Vec<(i64, usize, Rect)>,
 }
 
 impl App {
@@ -258,6 +261,9 @@ impl App {
             feature_form_tab_rects: Vec::new(),
             feature_form_field_rects: Vec::new(),
             feature_form_status_rects: Vec::new(),
+            agent_lane_visible: true,
+            agent_lane_area: Rect::default(),
+            agent_lane_tile_rects: Vec::new(),
         })
     }
 
@@ -443,6 +449,7 @@ impl App {
             "H" | "head" | "old" => self.palette_show_head(),
             "W" | "working" | "work" | "new" => self.palette_show_working(),
             "D" | "diff" => self.palette_show_diff(),
+            "L" | "lane" => self.toggle_agent_lane(),
             "" => {}
             other => self.status = format!("Not a command: {}", other),
         }
@@ -717,6 +724,7 @@ impl App {
             KeyCode::Char('P') => self.open_project_view()?,
             KeyCode::Char('G') => self.open_git_view()?,
             KeyCode::Char('a') => self.agent_for_selected_feature()?,
+            KeyCode::Char('L') => self.toggle_agent_lane(),
             KeyCode::Char('z') => self.cycle_editor_wrap(),
             KeyCode::Char('?') => self.help_visible = true,
             KeyCode::Char('q') => self.should_quit = true,
@@ -832,6 +840,14 @@ impl App {
         let in_tabs = contains(self.tabs_area, col, row);
         let in_left = contains(self.left_pane_area, col, row);
         let in_right = contains(self.right_pane_area, col, row);
+        let in_lane = self.agent_lane_visible && contains(self.agent_lane_area, col, row);
+
+        if in_lane {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.click_agent_lane(col, row);
+            }
+            return Ok(());
+        }
 
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -1024,6 +1040,30 @@ impl App {
         }
         self.persist_active_tree()?;
         Ok(())
+    }
+
+    fn click_agent_lane(&mut self, col: u16, row: u16) {
+        let hit = self
+            .agent_lane_tile_rects
+            .iter()
+            .find(|(_, _, r)| contains(*r, col, row))
+            .map(|(pid, idx, _)| (*pid, *idx));
+        let Some((pid, idx)) = hit else { return };
+        if let Some(pos) = self.open_projects.iter().position(|p| p.id == pid) {
+            self.active_index = pos;
+        }
+        if let Some(state) = self.active_state() {
+            state.view_mode = ViewMode::Agents;
+            if idx < state.agents.len() {
+                state.active_agent = Some(idx);
+            }
+            if let Some(i) = state.active_agent {
+                if let Some(a) = state.agents.get_mut(i) {
+                    a.clear_attention();
+                }
+            }
+        }
+        let _ = self.persist_open_projects();
     }
 
     fn click_right_pane(&mut self, col: u16, row: u16) {
@@ -1505,6 +1545,32 @@ impl App {
 
     pub fn tick(&mut self) {
         self.poll_ai_commit();
+        self.poll_agent_lane();
+    }
+
+    fn poll_agent_lane(&mut self) {
+        for state in self.project_views.values_mut() {
+            for agent in state.agents.iter_mut() {
+                agent.poll_status();
+            }
+        }
+        if matches!(self.current_view_mode(), Some(ViewMode::Agents)) {
+            if let Some(state) = self.active_state() {
+                if let Some(i) = state.active_agent {
+                    if let Some(a) = state.agents.get_mut(i) {
+                        a.clear_attention();
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn toggle_agent_lane(&mut self) {
+        self.agent_lane_visible = !self.agent_lane_visible;
+        if !self.agent_lane_visible {
+            self.agent_lane_area = Rect::default();
+            self.agent_lane_tile_rects.clear();
+        }
     }
 
     fn poll_ai_commit(&mut self) {
@@ -2535,21 +2601,29 @@ impl App {
     }
 
     fn spawn_agent(&mut self, resume_session_id: Option<String>) -> Result<()> {
-        let ai = self.ai_config.clone();
         let Some(project) = self.active_project().cloned() else {
             self.status = "No active project".into();
             return Ok(());
         };
+        self.spawn_agent_for_project(&project, resume_session_id, true)
+    }
+
+    fn spawn_agent_for_project(
+        &mut self,
+        project: &Project,
+        resume_session_id: Option<String>,
+        focus_agents_view: bool,
+    ) -> Result<()> {
+        let ai = self.ai_config.clone();
         let context_dir = self.write_agent_project_context(project.id, &project.name)?;
         let prompt = self.agent_system_prompt(&project.name, project.id, &context_dir);
-        let name = {
-            let count = self
-                .active_state_ref()
-                .map(|s| s.agents.len())
-                .unwrap_or(0);
-            let suffix = if resume_session_id.is_some() { " (resumed)" } else { "" };
-            format!("{} #{}{}", ai.provider, count + 1, suffix)
-        };
+        let count = self
+            .project_views
+            .get(&project.id)
+            .map(|s| s.agents.len())
+            .unwrap_or(0);
+        let suffix = if resume_session_id.is_some() { " (resumed)" } else { "" };
+        let name = format!("{} #{}{}", ai.provider, count + 1, suffix);
         match crate::views::agents::AgentSession::spawn(
             &ai,
             name,
@@ -2560,15 +2634,42 @@ impl App {
             80,
         ) {
             Ok(agent) => {
-                if let Some(state) = self.active_state() {
+                if let Some(state) = self.project_views.get_mut(&project.id) {
                     state.agents.push(agent);
-                    state.active_agent = Some(state.agents.len() - 1);
-                    state.view_mode = ViewMode::Agents;
+                    let new_idx = state.agents.len() - 1;
+                    if focus_agents_view {
+                        state.active_agent = Some(new_idx);
+                        state.view_mode = ViewMode::Agents;
+                    } else if state.active_agent.is_none() {
+                        state.active_agent = Some(new_idx);
+                    }
                 }
                 self.persist_agent_sessions(project.id);
             }
             Err(e) => {
                 self.status = format!("Failed to spawn agent: {}", e);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn restore_all_agents(&mut self) -> Result<()> {
+        let projects: Vec<Project> = self.open_projects.clone();
+        for p in projects {
+            let already = self
+                .project_views
+                .get(&p.id)
+                .map(|s| s.agent_resumed_this_run || !s.agents.is_empty())
+                .unwrap_or(true);
+            if already {
+                continue;
+            }
+            if let Some(state) = self.project_views.get_mut(&p.id) {
+                state.agent_resumed_this_run = true;
+            }
+            let saved = self.db.load_agent_sessions(p.id).unwrap_or_default();
+            for id in saved {
+                self.spawn_agent_for_project(&p, Some(id), false)?;
             }
         }
         Ok(())
@@ -3026,13 +3127,13 @@ This keeps the Project tab as the source of truth for the conversation history."
             self.with_feature_form(|f| f.toggle_page());
             return Ok(());
         }
-        let desc_editing = self
+        let editor_open = self
             .active_state_ref()
             .and_then(|s| s.project_view.as_ref())
             .and_then(|m| m.feature_form.as_ref())
-            .map(|f| f.description_editing())
+            .map(|f| f.editor_open())
             .unwrap_or(false);
-        if desc_editing {
+        if editor_open {
             return self.on_key_feature_form_editor(key);
         }
         let focus = match self
@@ -3116,6 +3217,9 @@ This keeps the Project tab as the source of truth for the conversation history."
         if ctrl && !alt {
             return self.handle_text_focus_ctrl_key(key, focus);
         }
+        if matches!(focus, FormFocus::Comment(_) | FormFocus::NewComment) && !alt {
+            return self.handle_message_focus_key(key);
+        }
         match key.code {
             KeyCode::Down => {
                 self.with_feature_form(|f| f.focus_next());
@@ -3151,6 +3255,28 @@ This keeps the Project tab as the source of truth for the conversation history."
             _ => {}
         }
         let _ = FormFocus::Title;
+        Ok(())
+    }
+
+    fn handle_message_focus_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.with_feature_form(|f| f.focus_next());
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.with_feature_form(|f| f.focus_prev());
+            }
+            KeyCode::Enter
+            | KeyCode::Char('i')
+            | KeyCode::Char('a')
+            | KeyCode::Char('o')
+            | KeyCode::Char(' ') => {
+                self.with_feature_form(|f| {
+                    let _ = f.open_editor_for_focus();
+                });
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -3210,7 +3336,7 @@ This keeps the Project tab as the source of truth for the conversation history."
             .map(|e| e.mode == EditorMode::Normal)
             .unwrap_or(false);
         if normal_mode && close_keys {
-            self.with_feature_form(|f| f.commit_description_editor());
+            self.with_feature_form(|f| f.commit_editor());
             return Ok(());
         }
         let pending_status = {
@@ -3289,7 +3415,8 @@ This keeps the Project tab as the source of truth for the conversation history."
                     ProjectSection::AiNotes => model.meta.ai_notes.clone(),
                 };
                 let path = std::env::temp_dir().join("coffeetable_project_meta.md");
-                if let Ok(view) = EditorView::from_content(path, initial) {
+                if let Ok(mut view) = EditorView::from_content(path, initial) {
+                    view.wrap_mode = crate::views::editor::WrapMode::Hard(80);
                     model.editor = Some(view);
                     model.editing_section = Some(section);
                 }
@@ -3353,8 +3480,8 @@ This keeps the Project tab as the source of truth for the conversation history."
             .and_then(|s| s.project_view.as_mut())
             .and_then(|m| m.feature_form.as_mut())
         {
-            if form.description_editing() {
-                form.commit_description_editor();
+            if form.editor_open() {
+                form.commit_editor();
             }
             let _ = form.commit_new_step();
             let _ = form.commit_new_comment();
@@ -3453,7 +3580,7 @@ This keeps the Project tab as the source of truth for the conversation history."
             .and_then(|m| m.feature_form.as_ref())
             .map(|f| {
                 f.dirty
-                    || f.description_editing()
+                    || f.editor_open()
                     || !f.new_step_buf.trim().is_empty()
                     || !f.new_comment_buf.trim().is_empty()
             })

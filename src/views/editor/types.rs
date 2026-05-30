@@ -80,6 +80,7 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { key: "H", aliases: &["head", "old"], description: "Show HEAD version of file (read-only)" },
     CommandDef { key: "W", aliases: &["working", "work", "new"], description: "Back to working copy (editable)" },
     CommandDef { key: "D", aliases: &["diff"], description: "Show unified diff against HEAD (read-only)" },
+    CommandDef { key: "L", aliases: &["lane"], description: "Toggle the Agents lane (right side)" },
 ];
 
 pub fn filter_commands(query: &str) -> Vec<usize> {

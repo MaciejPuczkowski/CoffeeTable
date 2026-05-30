@@ -19,6 +19,13 @@ pub enum FormPage {
     Comments,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorTarget {
+    Description,
+    Comment(usize),
+    NewComment,
+}
+
 
 #[derive(Debug, Clone)]
 pub struct StepDraft {
@@ -51,6 +58,7 @@ pub struct FeatureForm {
     pub focus: FormFocus,
     pub cursor: usize,
     pub editor: Option<EditorView>,
+    pub editor_target: Option<EditorTarget>,
     pub dirty: bool,
 }
 
@@ -70,6 +78,7 @@ impl FeatureForm {
             focus: FormFocus::Title,
             cursor: 0,
             editor: None,
+            editor_target: None,
             dirty: false,
         }
     }
@@ -108,6 +117,7 @@ impl FeatureForm {
             focus: FormFocus::Title,
             cursor: feature.title.chars().count(),
             editor: None,
+            editor_target: None,
             dirty: false,
         }
     }
@@ -164,8 +174,23 @@ impl FeatureForm {
         }
     }
 
+    pub fn editor_open(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    pub fn editor_target(&self) -> Option<EditorTarget> {
+        self.editor_target
+    }
+
     pub fn description_editing(&self) -> bool {
-        self.editor.is_some() && matches!(self.focus, FormFocus::Description)
+        matches!(self.editor_target, Some(EditorTarget::Description))
+    }
+
+    pub fn message_editing(&self) -> bool {
+        matches!(
+            self.editor_target,
+            Some(EditorTarget::Comment(_) | EditorTarget::NewComment)
+        )
     }
 
     pub fn current_text(&self) -> Option<&str> {
@@ -402,15 +427,15 @@ impl FeatureForm {
     }
 
     fn commit_pending_buffers_on_leave(&mut self) {
+        if self.editor.is_some() {
+            self.commit_editor();
+        }
         match self.focus {
             FormFocus::NewStep => {
                 let _ = self.commit_new_step();
             }
             FormFocus::NewComment => {
                 let _ = self.commit_new_comment();
-            }
-            FormFocus::Description => {
-                self.commit_description_editor();
             }
             _ => {}
         }
@@ -508,21 +533,67 @@ impl FeatureForm {
         if !matches!(self.focus, FormFocus::Description) {
             return Ok(());
         }
-        let path = std::env::temp_dir().join("coffeetable_feature_description.tmp");
-        let mut editor = EditorView::from_content(path, self.description.clone())?;
+        self.open_editor_for(EditorTarget::Description)
+    }
+
+    pub fn open_editor_for_focus(&mut self) -> Result<()> {
+        match self.focus {
+            FormFocus::Description => self.open_editor_for(EditorTarget::Description),
+            FormFocus::Comment(i) => self.open_editor_for(EditorTarget::Comment(i)),
+            FormFocus::NewComment => self.open_editor_for(EditorTarget::NewComment),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn open_editor_for(&mut self, target: EditorTarget) -> Result<()> {
+        let (path_name, initial) = match target {
+            EditorTarget::Description => (
+                "coffeetable_feature_description.tmp",
+                self.description.clone(),
+            ),
+            EditorTarget::Comment(i) => match self.comments.get(i) {
+                Some(c) if !c.deleted => ("coffeetable_feature_comment.tmp", c.message.clone()),
+                _ => return Ok(()),
+            },
+            EditorTarget::NewComment => (
+                "coffeetable_feature_new_comment.tmp",
+                self.new_comment_buf.clone(),
+            ),
+        };
+        let path = std::env::temp_dir().join(path_name);
+        let mut editor = EditorView::from_content(path, initial)?;
         editor.mode = crate::views::editor::EditorMode::Insert;
+        editor.wrap_mode = crate::views::editor::WrapMode::Hard(80);
         editor.cursor.0 = editor.lines.len().saturating_sub(1);
         editor.cursor.1 = editor.lines.last().map(|l| l.len()).unwrap_or(0);
         self.editor = Some(editor);
+        self.editor_target = Some(target);
         Ok(())
     }
 
-    pub fn commit_description_editor(&mut self) {
+    pub fn commit_editor(&mut self) {
         let Some(editor) = self.editor.take() else { return };
+        let Some(target) = self.editor_target.take() else { return };
         let text = editor_text(&editor);
-        if text != self.description {
-            self.description = text;
-            self.dirty = true;
+        match target {
+            EditorTarget::Description => {
+                if text != self.description {
+                    self.description = text;
+                    self.dirty = true;
+                }
+            }
+            EditorTarget::Comment(i) => {
+                if let Some(c) = self.comments.get_mut(i) {
+                    if c.message != text {
+                        c.message = text;
+                        self.dirty = true;
+                    }
+                }
+            }
+            EditorTarget::NewComment => {
+                self.new_comment_buf = text;
+                let _ = self.commit_new_comment();
+            }
         }
     }
 }
