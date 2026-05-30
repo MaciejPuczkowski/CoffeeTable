@@ -11,7 +11,7 @@ mod mouse;
 mod types;
 mod widget;
 
-pub use types::{COMMANDS, EditorMode, GitView, filter_commands};
+pub use types::{COMMANDS, EditorMode, GitView, WrapMode, filter_commands};
 pub use widget::{EditorWidget, render_command_line};
 
 use types::{Snapshot, YankRegister};
@@ -49,6 +49,7 @@ pub struct EditorView {
     pub pill_diff: Option<Rect>,
     pub gutter_width: u16,
     pub highlighter: Highlighter,
+    pub wrap_mode: WrapMode,
 }
 
 impl EditorView {
@@ -96,7 +97,14 @@ impl EditorView {
             pill_diff: None,
             gutter_width: 0,
             highlighter,
+            wrap_mode: WrapMode::Off,
         })
+    }
+
+    pub fn cycle_wrap(&mut self) {
+        self.wrap_mode = self.wrap_mode.cycle();
+        self.scroll_col = 0;
+        self.status = self.wrap_mode.label().to_string();
     }
 
     pub fn show_alt_view(&mut self, view: GitView, raw: String) {
@@ -196,9 +204,29 @@ impl EditorView {
         let h = self.viewport_rows as usize;
         if self.cursor.0 < self.scroll_row {
             self.scroll_row = self.cursor.0;
+        }
+        if self.wrap_mode.width().is_some() {
+            while self.scroll_row < self.cursor.0
+                && self.display_rows(self.scroll_row, self.cursor.0 + 1) > h
+            {
+                self.scroll_row += 1;
+            }
         } else if self.cursor.0 >= self.scroll_row + h {
             self.scroll_row = self.cursor.0 + 1 - h;
         }
+    }
+
+    fn display_rows(&self, start: usize, end: usize) -> usize {
+        let Some(w) = self.wrap_mode.width() else {
+            return end.saturating_sub(start);
+        };
+        let mut total = 0usize;
+        for i in start..end.min(self.lines.len()) {
+            let len = self.lines[i].len();
+            let chunks = if len == 0 { 1 } else { len.div_ceil(w) };
+            total += chunks;
+        }
+        total
     }
 
     pub(super) fn line_len(&self, row: usize) -> usize {

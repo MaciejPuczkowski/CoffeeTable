@@ -82,7 +82,7 @@ impl EditorView {
             (KeyCode::Delete, _) => self.delete_char_at_cursor(),
             (KeyCode::Enter, _) => self.split_line_at_cursor(),
             (KeyCode::Tab, _) => self.insert_str("    "),
-            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => self.insert_char(c),
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) => self.insert_char(c),
             _ => {}
         }
     }
@@ -151,7 +151,7 @@ impl EditorView {
                     self.mode = EditorMode::Normal;
                 }
             }
-            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => self.search.push(c),
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) => self.search.push(c),
             _ => {}
         }
     }

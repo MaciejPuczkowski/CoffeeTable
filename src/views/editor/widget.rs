@@ -1,5 +1,5 @@
 use super::EditorView;
-use super::types::{EditorMode, GitView};
+use super::types::{EditorMode, GitView, WrapMode};
 use crate::git::GitStatus;
 use ratatui::{
     buffer::Buffer,
@@ -36,19 +36,57 @@ impl<'a> Widget for EditorWidget<'a> {
         let highlighted = self.view.render_visible_lines(layout.visible_range_end());
         let selection = SelectionFrame::for_mode(self.view);
 
-        for (i, row_idx) in (self.view.scroll_row..layout.visible_range_end()).enumerate() {
-            let cell_y = inner.y + i as u16;
-            paint_gutter(buf, inner, &layout, row_idx, cell_y);
-            paint_line(
-                buf,
-                self.view,
-                &layout,
-                row_idx,
-                cell_y,
-                highlighted.get(row_idx),
-                &selection,
-            );
+        let viewport_h = inner.height as usize;
+        let mut cell_y = inner.y;
+        let mut row_idx = self.view.scroll_row;
+        while (cell_y as usize) < (inner.y as usize) + viewport_h {
+            if row_idx >= self.view.lines.len() {
+                break;
+            }
+            let chunks = visual_chunks_for_row(self.view, &layout, row_idx);
+            for (chunk_i, chunk) in chunks.iter().enumerate() {
+                if (cell_y as usize) >= (inner.y as usize) + viewport_h {
+                    break;
+                }
+                paint_gutter(buf, inner, &layout, row_idx, cell_y, chunk_i == 0);
+                paint_line(
+                    buf,
+                    self.view,
+                    &layout,
+                    row_idx,
+                    cell_y,
+                    *chunk,
+                    highlighted.get(row_idx),
+                    &selection,
+                );
+                cell_y += 1;
+            }
+            row_idx += 1;
         }
+    }
+}
+
+fn visual_chunks_for_row(view: &EditorView, layout: &BodyLayout, row_idx: usize) -> Vec<(usize, usize)> {
+    let line_len = view.lines.get(row_idx).map(|l| l.len()).unwrap_or(0);
+    let Some(wrap_w) = wrap_width(view, layout) else {
+        return vec![(view.scroll_col, layout.body_w)];
+    };
+    if line_len == 0 {
+        return vec![(0, wrap_w)];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < line_len {
+        chunks.push((start, wrap_w));
+        start += wrap_w;
+    }
+    chunks
+}
+
+fn wrap_width(view: &EditorView, layout: &BodyLayout) -> Option<usize> {
+    match view.wrap_mode {
+        WrapMode::Off => None,
+        WrapMode::Hard(_) => Some(view.wrap_mode.width()?.min(layout.body_w).max(1)),
     }
 }
 
@@ -232,12 +270,20 @@ impl EditorView {
     }
 }
 
-fn paint_gutter(buf: &mut Buffer, inner: Rect, layout: &BodyLayout, row_idx: usize, cell_y: u16) {
-    let gutter = format!(
-        "{:>width$} ",
-        row_idx + 1,
-        width = layout.gutter_width as usize - 1
-    );
+fn paint_gutter(
+    buf: &mut Buffer,
+    inner: Rect,
+    layout: &BodyLayout,
+    row_idx: usize,
+    cell_y: u16,
+    is_first_chunk: bool,
+) {
+    let width = layout.gutter_width as usize - 1;
+    let gutter = if is_first_chunk {
+        format!("{:>width$} ", row_idx + 1, width = width)
+    } else {
+        format!("{:>width$} ", "", width = width)
+    };
     let style = Style::default().fg(Color::DarkGray);
     for (gi, ch) in gutter.chars().enumerate() {
         let x = inner.x + gi as u16;
@@ -254,23 +300,22 @@ fn paint_line(
     layout: &BodyLayout,
     row_idx: usize,
     cell_y: u16,
+    chunk: (usize, usize),
     spans: Option<&Vec<(Style, String)>>,
     selection: &SelectionFrame,
 ) {
-    let scroll_col = view.scroll_col;
+    let (start_col, chunk_w) = chunk;
+    let end_col = start_col + chunk_w;
     let row_bg = diff_row_bg(view, row_idx);
     if let Some(bg) = row_bg {
-        paint_row_background(buf, layout, cell_y, bg);
+        paint_row_background(buf, layout, cell_y, bg, chunk_w);
     }
     let mut char_idx = 0usize;
     if let Some(spans) = spans {
         'spans: for (style, text) in spans {
             for ch in text.chars() {
-                if char_idx >= scroll_col {
-                    let disp_x = char_idx - scroll_col;
-                    if disp_x >= layout.body_w {
-                        break 'spans;
-                    }
+                if char_idx >= start_col && char_idx < end_col {
+                    let disp_x = char_idx - start_col;
                     let cell_style =
                         style_for_cell(view, *style, row_idx, char_idx, selection, row_bg);
                     buf[(layout.body_x + disp_x as u16, cell_y)]
@@ -278,12 +323,17 @@ fn paint_line(
                         .set_style(cell_style);
                 }
                 char_idx += 1;
+                if char_idx >= end_col {
+                    break 'spans;
+                }
             }
         }
     }
-    paint_trailing_cursor(buf, view, layout, row_idx, cell_y, char_idx);
+    paint_trailing_cursor(buf, view, layout, row_idx, cell_y, char_idx, start_col, chunk_w);
     if selection.active && selection.linewise {
-        paint_linewise_trailing(buf, view, layout, row_idx, cell_y, char_idx, selection);
+        paint_linewise_trailing(
+            buf, view, layout, row_idx, cell_y, char_idx, selection, start_col, chunk_w,
+        );
     }
 }
 
@@ -301,9 +351,10 @@ fn diff_row_bg(view: &EditorView, row_idx: usize) -> Option<Color> {
     }
 }
 
-fn paint_row_background(buf: &mut Buffer, layout: &BodyLayout, cell_y: u16, bg: Color) {
+fn paint_row_background(buf: &mut Buffer, layout: &BodyLayout, cell_y: u16, bg: Color, width: usize) {
     let style = Style::default().bg(bg);
-    for dx in 0..layout.body_w {
+    let w = width.min(layout.body_w);
+    for dx in 0..w {
         let x = layout.body_x + dx as u16;
         buf[(x, cell_y)].set_char(' ').set_style(style);
     }
@@ -337,15 +388,18 @@ fn paint_trailing_cursor(
     row_idx: usize,
     cell_y: u16,
     char_idx: usize,
+    start_col: usize,
+    chunk_w: usize,
 ) {
     if !view.focused
         || row_idx != view.cursor.0
-        || view.cursor.1 < view.scroll_col
+        || view.cursor.1 < start_col
+        || view.cursor.1 >= start_col + chunk_w
         || view.cursor.1 < char_idx
     {
         return;
     }
-    let disp_x = view.cursor.1 - view.scroll_col;
+    let disp_x = view.cursor.1 - start_col;
     if disp_x >= layout.body_w {
         return;
     }
@@ -362,13 +416,15 @@ fn paint_linewise_trailing(
     cell_y: u16,
     char_idx: usize,
     selection: &SelectionFrame,
+    start_col: usize,
+    chunk_w: usize,
 ) {
     let line_len = view.lines[row_idx].len();
     let mut col_abs = line_len.max(char_idx);
-    let scroll_col = view.scroll_col;
+    let end_col = start_col + chunk_w;
     while selection.contains(row_idx, col_abs) {
-        if col_abs >= scroll_col {
-            let disp_x = col_abs - scroll_col;
+        if col_abs >= start_col && col_abs < end_col {
+            let disp_x = col_abs - start_col;
             if disp_x >= layout.body_w {
                 break;
             }
@@ -377,7 +433,7 @@ fn paint_linewise_trailing(
                 .set_style(Style::default().bg(SELECTION_BG));
         }
         col_abs += 1;
-        if col_abs - line_len > layout.body_w + scroll_col {
+        if col_abs >= end_col {
             break;
         }
     }

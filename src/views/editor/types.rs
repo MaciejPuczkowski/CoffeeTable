@@ -14,6 +14,38 @@ pub enum GitView {
     Diff,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapMode {
+    Off,
+    Hard(u16),
+}
+
+impl WrapMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            WrapMode::Off => WrapMode::Hard(120),
+            WrapMode::Hard(120) => WrapMode::Hard(80),
+            _ => WrapMode::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WrapMode::Off => "no wrap",
+            WrapMode::Hard(120) => "wrap 120",
+            WrapMode::Hard(80) => "wrap 80",
+            WrapMode::Hard(_) => "wrap",
+        }
+    }
+
+    pub fn width(self) -> Option<usize> {
+        match self {
+            WrapMode::Hard(n) => Some(n as usize),
+            WrapMode::Off => None,
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct YankRegister {
     pub text: String,
