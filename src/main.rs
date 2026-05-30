@@ -1,3 +1,4 @@
+mod agent_cli;
 mod ai;
 mod app;
 mod clipboard;
@@ -24,9 +25,13 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, time::Duration};
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|s| s.as_str()) == Some("agent") {
+        return agent_cli::run(&args[1..]);
+    }
     let paths = Paths::resolve()?;
     let db = Db::open(&paths.db_file)?;
-    let mut app = App::new(db, paths.settings_file)?;
+    let mut app = App::new(db, paths)?;
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app);
