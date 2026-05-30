@@ -3,9 +3,20 @@ use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+const ACTIVITY_FRESH_SECS: u64 = 3;
+const FOOTER_ROWS_TO_IGNORE: u16 = 2;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LaneStatus {
+    Working,
+    Idle,
+}
 
 pub struct AgentSession {
     pub name: String,
@@ -19,6 +30,10 @@ pub struct AgentSession {
     pub session_id: Option<String>,
     pub cwd: PathBuf,
     pre_session_files: HashSet<String>,
+    last_screen_hash: u64,
+    last_activity_at: Instant,
+    last_bell_count: usize,
+    pub bells_pending: usize,
 }
 
 impl AgentSession {
@@ -67,7 +82,59 @@ impl AgentSession {
             session_id: resume_session.map(|s| s.to_string()),
             cwd: cwd.to_path_buf(),
             pre_session_files,
+            last_screen_hash: 0,
+            last_activity_at: Instant::now(),
+            last_bell_count: 0,
+            bells_pending: 0,
         })
+    }
+
+    pub fn poll_status(&mut self) {
+        let Ok(p) = self.parser.lock() else { return };
+        let screen = p.screen();
+        let (rows, cols) = screen.size();
+        let body_end = rows.saturating_sub(FOOTER_ROWS_TO_IGNORE);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (i, line) in screen.rows(0, cols).enumerate() {
+            if (i as u16) >= body_end {
+                break;
+            }
+            line.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+        let bells = screen.audible_bell_count();
+        drop(p);
+        if hash != self.last_screen_hash {
+            self.last_screen_hash = hash;
+            self.last_activity_at = Instant::now();
+        }
+        if bells > self.last_bell_count {
+            self.bells_pending = self.bells_pending.saturating_add(bells - self.last_bell_count);
+            self.last_bell_count = bells;
+        }
+    }
+
+    pub fn clear_attention(&mut self) {
+        self.bells_pending = 0;
+    }
+
+    pub fn lane_status(&self) -> LaneStatus {
+        if self.last_activity_at.elapsed().as_secs() <= ACTIVITY_FRESH_SECS {
+            LaneStatus::Working
+        } else {
+            LaneStatus::Idle
+        }
+    }
+
+    pub fn activity_age_label(&self) -> String {
+        let s = self.last_activity_at.elapsed().as_secs();
+        if s < 60 {
+            format!("{}s", s)
+        } else if s < 3600 {
+            format!("{}m", s / 60)
+        } else {
+            format!("{}h", s / 3600)
+        }
     }
 
     pub fn try_capture_session_id(&mut self) -> bool {
