@@ -19,6 +19,7 @@ pub struct TerminalView {
     _child: Box<dyn portable_pty::Child + Send + Sync>,
     pub last_rows: u16,
     pub last_cols: u16,
+    pub scrollback: usize,
 }
 
 impl TerminalView {
@@ -64,7 +65,16 @@ impl TerminalView {
             _child: child,
             last_rows: rows,
             last_cols: cols,
+            scrollback: 0,
         })
+    }
+
+    pub fn scroll(&mut self, delta: i32) {
+        self.scrollback = apply_scroll(&self.parser, self.scrollback, delta);
+    }
+
+    pub fn reset_scrollback(&mut self) {
+        self.scrollback = 0;
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -88,6 +98,17 @@ impl TerminalView {
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
     }
+}
+
+pub fn apply_scroll(parser: &Arc<Mutex<vt100::Parser>>, current: usize, delta: i32) -> usize {
+    let Ok(mut p) = parser.lock() else { return current };
+    let requested = if delta >= 0 {
+        current.saturating_add(delta as usize)
+    } else {
+        current.saturating_sub((-delta) as usize)
+    };
+    p.set_scrollback(requested);
+    p.screen().scrollback()
 }
 
 fn spawn_reader(mut reader: Box<dyn Read + Send>, parser: Arc<Mutex<vt100::Parser>>) {
@@ -137,6 +158,9 @@ pub fn key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
             Some(format!("\x1b[{}~", code).into_bytes())
         }
         KeyCode::Char(c) => {
+            if ctrl && alt && !c.is_ascii() {
+                return Some(c.to_string().into_bytes());
+            }
             if ctrl && c.is_ascii() {
                 let lower = c.to_ascii_lowercase();
                 if ('a'..='z').contains(&lower) {
@@ -174,47 +198,59 @@ impl<'a> Widget for TerminalWidget<'a> {
             return;
         }
         self.view.resize(area.height, area.width);
-        let Ok(parser) = self.view.parser.lock() else { return };
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-        let max_rows = rows.min(area.height);
-        let max_cols = cols.min(area.width);
-        for r in 0..max_rows {
-            for c in 0..max_cols {
-                if let Some(cell) = screen.cell(r, c) {
-                    let mut style = Style::default();
-                    if let Some(fg) = vt_color_to_ratatui(cell.fgcolor()) {
-                        style = style.fg(fg);
-                    }
-                    if let Some(bg) = vt_color_to_ratatui(cell.bgcolor()) {
-                        style = style.bg(bg);
-                    }
-                    if cell.bold() {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    if cell.italic() {
-                        style = style.add_modifier(Modifier::ITALIC);
-                    }
-                    if cell.underline() {
-                        style = style.add_modifier(Modifier::UNDERLINED);
-                    }
-                    if cell.inverse() {
-                        style = style.add_modifier(Modifier::REVERSED);
-                    }
-                    let ch = cell.contents().chars().next().unwrap_or(' ');
-                    let cell_pos = (area.x + c, area.y + r);
-                    buf[cell_pos].set_char(ch).set_style(style);
+        if let Ok(mut p) = self.view.parser.lock() {
+            p.set_scrollback(self.view.scrollback);
+        }
+        render_pty_screen(area, buf, &self.view.parser, self.focused);
+    }
+}
+
+pub fn render_pty_screen(
+    area: Rect,
+    buf: &mut Buffer,
+    parser: &Arc<Mutex<vt100::Parser>>,
+    focused: bool,
+) {
+    let Ok(parser) = parser.lock() else { return };
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let max_rows = rows.min(area.height);
+    let max_cols = cols.min(area.width);
+    for r in 0..max_rows {
+        for c in 0..max_cols {
+            if let Some(cell) = screen.cell(r, c) {
+                let mut style = Style::default();
+                if let Some(fg) = vt_color_to_ratatui(cell.fgcolor()) {
+                    style = style.fg(fg);
                 }
+                if let Some(bg) = vt_color_to_ratatui(cell.bgcolor()) {
+                    style = style.bg(bg);
+                }
+                if cell.bold() {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if cell.italic() {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if cell.underline() {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if cell.inverse() {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                let ch = cell.contents().chars().next().unwrap_or(' ');
+                let cell_pos = (area.x + c, area.y + r);
+                buf[cell_pos].set_char(ch).set_style(style);
             }
         }
-        if self.focused && !screen.hide_cursor() {
-            let (cy, cx) = screen.cursor_position();
-            if cy < area.height && cx < area.width {
-                let pos = (area.x + cx, area.y + cy);
-                let mut style = buf[pos].style();
-                style = style.add_modifier(Modifier::REVERSED);
-                buf[pos].set_style(style);
-            }
+    }
+    if focused && !screen.hide_cursor() {
+        let (cy, cx) = screen.cursor_position();
+        if cy < area.height && cx < area.width {
+            let pos = (area.x + cx, area.y + cy);
+            let mut style = buf[pos].style();
+            style = style.add_modifier(Modifier::REVERSED);
+            buf[pos].set_style(style);
         }
     }
 }
