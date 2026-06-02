@@ -67,6 +67,10 @@ pub struct AiConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub extra_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_token_limit: Option<u64>,
 }
 
 impl Default for AiConfig {
@@ -76,6 +80,8 @@ impl Default for AiConfig {
             binary: default_ai_binary(),
             model: None,
             extra_args: Vec::new(),
+            session_token_limit: None,
+            weekly_token_limit: None,
         }
     }
 }
@@ -142,6 +148,73 @@ impl Settings {
             ai: AiConfig::default(),
             shell: ShellConfig::default(),
         }
+    }
+
+    pub fn with_project_overrides(&self, overrides: &ProjectSettings) -> Self {
+        Self {
+            roots: self.roots.clone(),
+            search_excludes: overrides
+                .search_excludes
+                .clone()
+                .unwrap_or_else(|| self.search_excludes.clone()),
+            ai: overrides.ai.clone().unwrap_or_else(|| self.ai.clone()),
+            shell: overrides.shell.clone().unwrap_or_else(|| self.shell.clone()),
+        }
+    }
+}
+
+pub const PROJECT_SETTINGS_FILE: &str = "CoffeeTable.Settings.yaml";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_excludes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai: Option<AiConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ShellConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub views: Option<ViewsConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ViewsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<bool>,
+}
+
+impl ProjectSettings {
+    pub fn from_yaml(raw: &str) -> Result<Self> {
+        if raw.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        serde_yaml::from_str(raw).context("could not parse project settings YAML")
+    }
+
+    pub fn empty_template() -> String {
+        "# Project-scoped overrides for CoffeeTable.\n\
+         # Unset keys fall back to the global settings on the left.\n\
+         # Examples:\n\
+         #\n\
+         # search_excludes:\n\
+         #   - node_modules\n\
+         #   - target\n\
+         #\n\
+         # ai:\n\
+         #   provider: claude_cli\n\
+         #   binary: claude\n\
+         #   model: claude-opus-4-7\n\
+         #   extra_args: []\n\
+         #   session_token_limit: 200000\n\
+         #   weekly_token_limit: 5000000\n\
+         #\n\
+         # shell:\n\
+         #   command: pwsh\n\
+         #   args: []\n\
+         #\n\
+         # views:\n\
+         #   project: false   # hide the Project (Kanban) tab for this project\n"
+            .into()
     }
 }
 

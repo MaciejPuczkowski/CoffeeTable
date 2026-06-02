@@ -37,6 +37,18 @@ CREATE TABLE IF NOT EXISTS project_meta (
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS project_settings (
+    project_id INTEGER PRIMARY KEY,
+    yaml TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS project_runtime (
+    project_id INTEGER PRIMARY KEY,
+    yaml TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS features (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL,
@@ -242,6 +254,48 @@ impl Db {
             "INSERT INTO project_state (project_id, key, value) VALUES (?1, ?2, ?3)
              ON CONFLICT(project_id, key) DO UPDATE SET value = excluded.value",
             params![project_id, KEY_AGENT_SESSIONS, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_project_settings_yaml(&self, project_id: i64) -> Result<Option<String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT yaml FROM project_settings WHERE project_id = ?1",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw)
+    }
+
+    pub fn save_project_settings_yaml(&self, project_id: i64, yaml: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO project_settings (project_id, yaml) VALUES (?1, ?2)
+             ON CONFLICT(project_id) DO UPDATE SET yaml = excluded.yaml",
+            params![project_id, yaml],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_project_runtime_yaml(&self, project_id: i64) -> Result<Option<String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT yaml FROM project_runtime WHERE project_id = ?1",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw)
+    }
+
+    pub fn save_project_runtime_yaml(&self, project_id: i64, yaml: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO project_runtime (project_id, yaml) VALUES (?1, ?2)
+             ON CONFLICT(project_id) DO UPDATE SET yaml = excluded.yaml",
+            params![project_id, yaml],
         )?;
         Ok(())
     }
