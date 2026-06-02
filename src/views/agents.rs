@@ -23,7 +23,7 @@ pub struct AgentSession {
     pub parser: Arc<Mutex<vt100::Parser>>,
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
     pub last_rows: u16,
     pub last_cols: u16,
     pub scrollback: usize,
@@ -34,6 +34,11 @@ pub struct AgentSession {
     last_activity_at: Instant,
     last_bell_count: usize,
     pub bells_pending: usize,
+    pub selection: Option<crate::views::terminal::PtySelection>,
+    pub drag_anchor: Option<(u16, u16)>,
+    pub last_render_area: Option<Rect>,
+    pending_initial_input: Option<Vec<u8>>,
+    pending_initial_ready_after: Option<Instant>,
 }
 
 impl AgentSession {
@@ -75,7 +80,7 @@ impl AgentSession {
             parser,
             writer: Arc::new(Mutex::new(writer)),
             master: pair.master,
-            _child: child,
+            child,
             last_rows: rows,
             last_cols: cols,
             scrollback: 0,
@@ -86,7 +91,79 @@ impl AgentSession {
             last_activity_at: Instant::now(),
             last_bell_count: 0,
             bells_pending: 0,
+            selection: None,
+            drag_anchor: None,
+            last_render_area: None,
+            pending_initial_input: None,
+            pending_initial_ready_after: None,
         })
+    }
+
+    pub fn queue_initial_input(&mut self, bytes: Vec<u8>) {
+        self.pending_initial_input = Some(bytes);
+        self.pending_initial_ready_after =
+            Some(Instant::now() + std::time::Duration::from_millis(1500));
+    }
+
+    pub fn try_flush_initial_input(&mut self) -> bool {
+        let Some(bytes) = self.pending_initial_input.as_ref() else {
+            return false;
+        };
+        let ready_at = self.pending_initial_ready_after.unwrap_or_else(Instant::now);
+        if Instant::now() < ready_at {
+            return false;
+        }
+        let payload = bytes.clone();
+        self.pending_initial_input = None;
+        self.pending_initial_ready_after = None;
+        self.write_bytes(&payload);
+        true
+    }
+
+    pub fn cancel_initial_input(&mut self) {
+        self.pending_initial_input = None;
+        self.pending_initial_ready_after = None;
+    }
+
+    pub fn mouse_press(&mut self, area: Rect, col: u16, row: u16) {
+        if let Some(cell) = crate::views::terminal::screen_cell_from_xy(area, col, row) {
+            self.drag_anchor = Some(cell);
+            self.selection = Some(crate::views::terminal::PtySelection {
+                start: cell,
+                end: cell,
+            });
+        } else {
+            self.drag_anchor = None;
+            self.selection = None;
+        }
+    }
+
+    pub fn mouse_drag(&mut self, area: Rect, col: u16, row: u16) {
+        let Some(start) = self.drag_anchor else { return };
+        let Some(end) = crate::views::terminal::screen_cell_from_xy_clamped(area, col, row) else {
+            return;
+        };
+        self.selection = Some(crate::views::terminal::PtySelection { start, end });
+    }
+
+    pub fn mouse_release(&mut self) -> Option<String> {
+        let sel = self.selection?;
+        self.drag_anchor = None;
+        if sel.start == sel.end {
+            self.selection = None;
+            return None;
+        }
+        let text = crate::views::terminal::extract_pty_selection(&self.parser, sel);
+        if text.trim().is_empty() {
+            self.selection = None;
+            return None;
+        }
+        Some(text)
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.drag_anchor = None;
     }
 
     pub fn poll_status(&mut self) {
@@ -200,6 +277,16 @@ impl AgentSession {
             let _ = w.flush();
         }
     }
+
+    pub fn shutdown(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
 }
 
 fn build_command(
@@ -289,6 +376,13 @@ impl<'a> Widget for AgentWidget<'a> {
         if let Ok(mut p) = self.session.parser.lock() {
             p.set_scrollback(self.session.scrollback);
         }
-        crate::views::terminal::render_pty_screen(area, buf, &self.session.parser, self.focused);
+        self.session.last_render_area = Some(area);
+        crate::views::terminal::render_pty_screen_sel(
+            area,
+            buf,
+            &self.session.parser,
+            self.focused,
+            self.session.selection,
+        );
     }
 }

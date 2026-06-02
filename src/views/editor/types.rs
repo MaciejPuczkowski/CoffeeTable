@@ -76,11 +76,21 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { key: "t", aliases: &["tree", "explorer"], description: "Focus file tree" },
     CommandDef { key: "b", aliases: &["buffer"], description: "Focus editor" },
     CommandDef { key: "h", aliases: &["help"], description: "Show help overlay" },
-    CommandDef { key: "S", aliases: &["settings", "config"], description: "Open settings.yaml in editor" },
+    CommandDef { key: "S", aliases: &["settings", "config"], description: "Open settings split (global ↔ project)" },
+    CommandDef { key: "import-settings", aliases: &["psi"], description: "Import CoffeeTable.Settings.yaml from project root into DB" },
+    CommandDef { key: "export-settings", aliases: &["pse"], description: "Export project settings from DB to CoffeeTable.Settings.yaml" },
+    CommandDef { key: "import-runtime", aliases: &["rti"], description: "Import CoffeeTable.Runtime.yaml from project root into DB" },
+    CommandDef { key: "export-runtime", aliases: &["rte"], description: "Export runtime config from DB to CoffeeTable.Runtime.yaml" },
     CommandDef { key: "H", aliases: &["head", "old"], description: "Show HEAD version of file (read-only)" },
     CommandDef { key: "W", aliases: &["working", "work", "new"], description: "Back to working copy (editable)" },
     CommandDef { key: "D", aliases: &["diff"], description: "Show unified diff against HEAD (read-only)" },
     CommandDef { key: "L", aliases: &["lane"], description: "Toggle the Agents lane (right side)" },
+    CommandDef { key: "R", aliases: &["rename"], description: "Rename the active agent (Agents view)" },
+    CommandDef { key: "runtime", aliases: &[], description: "Open Runtime view" },
+    CommandDef { key: "run", aliases: &[], description: "Run service(s) — :run <name> or :run for all" },
+    CommandDef { key: "stop", aliases: &[], description: "Stop service(s) — :stop <name> or :stop for all" },
+    CommandDef { key: "build", aliases: &[], description: "Build service(s) — :build <name> or :build for all" },
+    CommandDef { key: "restart", aliases: &[], description: "Restart service(s) — :restart <name> or all" },
 ];
 
 pub fn filter_commands(query: &str) -> Vec<usize> {

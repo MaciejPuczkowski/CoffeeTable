@@ -2,7 +2,7 @@ use crate::syntax::Highlighter;
 use anyhow::{Context, Result};
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
-use std::path::PathBuf;
+use std::{path::PathBuf, time::SystemTime};
 
 mod edit;
 mod modes;
@@ -50,6 +50,8 @@ pub struct EditorView {
     pub gutter_width: u16,
     pub highlighter: Highlighter,
     pub wrap_mode: WrapMode,
+    pub disk_mtime: Option<SystemTime>,
+    pub disk_conflict_warned: bool,
 }
 
 impl EditorView {
@@ -64,6 +66,7 @@ impl EditorView {
             .unwrap_or("")
             .to_string();
         let highlighter = Highlighter::for_extension(&ext);
+        let disk_mtime = file_mtime(&path);
         Ok(Self {
             path,
             lines,
@@ -98,6 +101,8 @@ impl EditorView {
             gutter_width: 0,
             highlighter,
             wrap_mode: WrapMode::Off,
+            disk_mtime,
+            disk_conflict_warned: false,
         })
     }
 
@@ -183,6 +188,8 @@ impl EditorView {
             .with_context(|| format!("write {}", self.path.display()))?;
         self.modified = false;
         self.did_save = true;
+        self.disk_mtime = file_mtime(&self.path);
+        self.disk_conflict_warned = false;
         self.status = format!("\"{}\" written", self.path.display());
         Ok(())
     }
@@ -268,11 +275,71 @@ impl EditorView {
                 self.modified = false;
                 self.undo.clear();
                 self.redo.clear();
+                self.disk_mtime = file_mtime(&self.path);
+                self.disk_conflict_warned = false;
                 self.status = format!("\"{}\" reloaded", self.path.display());
             }
             Err(e) => self.status = format!("Reload failed: {}", e),
         }
     }
+
+    pub fn poll_disk(&mut self) -> bool {
+        if !matches!(self.git_view, GitView::Working) {
+            return false;
+        }
+        let Some(current) = file_mtime(&self.path) else {
+            return false;
+        };
+        let prev = match self.disk_mtime {
+            Some(t) => t,
+            None => {
+                self.disk_mtime = Some(current);
+                return false;
+            }
+        };
+        if current <= prev {
+            return false;
+        }
+        if self.modified {
+            if !self.disk_conflict_warned {
+                self.disk_conflict_warned = true;
+                self.status = format!(
+                    "{} changed on disk — unsaved buffer kept (\":e!\" to reload)",
+                    self.path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                );
+            }
+            return false;
+        }
+        match std::fs::read_to_string(&self.path) {
+            Ok(raw) => {
+                let mut new_lines = parse_lines(&raw);
+                if new_lines.is_empty() {
+                    new_lines.push(Vec::new());
+                }
+                let cursor = self.cursor;
+                self.lines = new_lines;
+                if self.cursor.0 >= self.lines.len() {
+                    self.cursor.0 = self.lines.len().saturating_sub(1);
+                }
+                let max_col = self.lines.get(self.cursor.0).map(|l| l.len()).unwrap_or(0);
+                if self.cursor.1 > max_col {
+                    self.cursor.1 = max_col;
+                }
+                let _ = cursor;
+                self.disk_mtime = Some(current);
+                self.disk_conflict_warned = false;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 fn parse_lines(raw: &str) -> Vec<Vec<char>> {

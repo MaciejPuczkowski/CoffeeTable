@@ -67,6 +67,10 @@ impl FileTreeView {
         self.git_status.get(path).copied()
     }
 
+    pub fn git_status(&self) -> &HashMap<PathBuf, GitStatus> {
+        &self.git_status
+    }
+
     pub fn set_filter(&mut self, query: String) {
         let prev_selected = self.selected_path.clone();
         self.filter = query;
@@ -83,6 +87,17 @@ impl FileTreeView {
         self.filter.clear();
         self.rebuild_visible();
         self.restore_selection();
+    }
+
+    pub fn refresh(&mut self) {
+        let prev_selected = self.selected_path.clone();
+        self.cache.clear();
+        self.rebuild_visible();
+        if let Some(p) = prev_selected {
+            self.reselect(&p);
+        } else {
+            self.restore_selection();
+        }
     }
 
     pub fn mouse_select(&mut self, row: u16) -> Action {
@@ -335,11 +350,11 @@ impl FileTreeView {
                 .filter_map(|r| r.ok())
                 .filter_map(|d| {
                     let name = d.file_name().to_string_lossy().into_owned();
-                    if name.starts_with('.') && name != ".github" {
+                    let is_dir = d.file_type().ok()?.is_dir();
+                    if is_dir && name == ".git" {
                         return None;
                     }
                     let path = d.path();
-                    let is_dir = d.file_type().ok()?.is_dir();
                     Some(DirEntry { name, path, is_dir })
                 })
                 .collect(),

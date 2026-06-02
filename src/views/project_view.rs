@@ -152,6 +152,7 @@ pub struct ProjectViewModel {
     pub editor: Option<EditorView>,
     pub editing_section: Option<ProjectSection>,
     pub feature_form: Option<FeatureForm>,
+    pub preview_scroll: u16,
 }
 
 impl ProjectViewModel {
@@ -166,6 +167,16 @@ impl ProjectViewModel {
             editor: None,
             editing_section: None,
             feature_form: None,
+            preview_scroll: 0,
+        }
+    }
+
+    pub fn scroll_preview(&mut self, delta: i32) {
+        if delta < 0 {
+            let d = (-delta) as u16;
+            self.preview_scroll = self.preview_scroll.saturating_sub(d);
+        } else {
+            self.preview_scroll = self.preview_scroll.saturating_add(delta as u16);
         }
     }
 
@@ -209,17 +220,19 @@ impl ProjectViewModel {
     pub fn sync_selection_from_list(&mut self) {
         let idx = self.list_state.selected().unwrap_or(0);
         let sections = ProjectSection::all();
+        let prev = self.selection;
         if idx < sections.len() {
             self.selection = ProjectSelection::Meta(sections[idx]);
-            return;
-        }
-        if idx == sections.len() {
+        } else if idx == sections.len() {
             self.selection = ProjectSelection::NewFeature;
-            return;
+        } else {
+            let feat_idx = idx - sections.len() - 1;
+            if feat_idx < self.features.len() {
+                self.selection = ProjectSelection::Feature(feat_idx);
+            }
         }
-        let feat_idx = idx - sections.len() - 1;
-        if feat_idx < self.features.len() {
-            self.selection = ProjectSelection::Feature(feat_idx);
+        if self.selection != prev {
+            self.preview_scroll = 0;
         }
     }
 

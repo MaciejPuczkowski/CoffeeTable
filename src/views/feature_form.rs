@@ -14,12 +14,6 @@ pub enum FormFocus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FormPage {
-    Details,
-    Comments,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorTarget {
     Description,
     Comment(usize),
@@ -54,12 +48,12 @@ pub struct FeatureForm {
     pub comments: Vec<CommentDraft>,
     pub new_step_buf: String,
     pub new_comment_buf: String,
-    pub page: FormPage,
     pub focus: FormFocus,
     pub cursor: usize,
     pub editor: Option<EditorView>,
     pub editor_target: Option<EditorTarget>,
     pub dirty: bool,
+    pub scroll_offset: u16,
 }
 
 impl FeatureForm {
@@ -74,12 +68,12 @@ impl FeatureForm {
             comments: Vec::new(),
             new_step_buf: String::new(),
             new_comment_buf: String::new(),
-            page: FormPage::Details,
             focus: FormFocus::Title,
             cursor: 0,
             editor: None,
             editor_target: None,
             dirty: false,
+            scroll_offset: 0,
         }
     }
 
@@ -113,34 +107,18 @@ impl FeatureForm {
                 .collect(),
             new_step_buf: String::new(),
             new_comment_buf: String::new(),
-            page: FormPage::Details,
             focus: FormFocus::Title,
             cursor: feature.title.chars().count(),
             editor: None,
             editor_target: None,
             dirty: false,
+            scroll_offset: 0,
         }
     }
 
-    pub fn switch_to_details(&mut self) {
-        if matches!(self.page, FormPage::Details) {
-            return;
-        }
+    pub fn focus_first_comment(&mut self) {
         self.commit_pending_buffers_on_leave();
         self.editor = None;
-        self.page = FormPage::Details;
-        self.focus = FormFocus::Title;
-        self.reset_cursor_to_end();
-        self.sync_status_cursor();
-    }
-
-    pub fn switch_to_comments(&mut self) {
-        if matches!(self.page, FormPage::Comments) {
-            return;
-        }
-        self.commit_pending_buffers_on_leave();
-        self.editor = None;
-        self.page = FormPage::Comments;
         self.focus = match self.first_visible_comment() {
             Some(i) => FormFocus::Comment(i),
             None => FormFocus::NewComment,
@@ -148,10 +126,20 @@ impl FeatureForm {
         self.reset_cursor_to_end();
     }
 
-    pub fn toggle_page(&mut self) {
-        match self.page {
-            FormPage::Details => self.switch_to_comments(),
-            FormPage::Comments => self.switch_to_details(),
+    pub fn focus_title(&mut self) {
+        self.commit_pending_buffers_on_leave();
+        self.editor = None;
+        self.focus = FormFocus::Title;
+        self.reset_cursor_to_end();
+        self.sync_status_cursor();
+    }
+
+    pub fn scroll_lines(&mut self, delta: i32) {
+        if delta < 0 {
+            let d = (-delta) as u16;
+            self.scroll_offset = self.scroll_offset.saturating_sub(d);
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_add(delta as u16);
         }
     }
 
@@ -166,31 +154,8 @@ impl FeatureForm {
         self.sync_status_cursor();
     }
 
-    pub fn set_status(&mut self, status: FeatureStatus) {
-        self.status_cursor = status;
-        if self.status != status {
-            self.status = status;
-            self.dirty = true;
-        }
-    }
-
     pub fn editor_open(&self) -> bool {
         self.editor.is_some()
-    }
-
-    pub fn editor_target(&self) -> Option<EditorTarget> {
-        self.editor_target
-    }
-
-    pub fn description_editing(&self) -> bool {
-        matches!(self.editor_target, Some(EditorTarget::Description))
-    }
-
-    pub fn message_editing(&self) -> bool {
-        matches!(
-            self.editor_target,
-            Some(EditorTarget::Comment(_) | EditorTarget::NewComment)
-        )
     }
 
     pub fn current_text(&self) -> Option<&str> {
@@ -374,21 +339,21 @@ impl FeatureForm {
                 Some(next) => FormFocus::Step(next),
                 None => FormFocus::NewStep,
             },
-            FormFocus::NewStep => FormFocus::Title,
+            FormFocus::NewStep => match self.first_visible_comment() {
+                Some(i) => FormFocus::Comment(i),
+                None => FormFocus::NewComment,
+            },
             FormFocus::Comment(i) => match self.next_visible_comment(i) {
                 Some(next) => FormFocus::Comment(next),
                 None => FormFocus::NewComment,
             },
-            FormFocus::NewComment => match self.first_visible_comment() {
-                Some(i) => FormFocus::Comment(i),
-                None => FormFocus::NewComment,
-            },
+            FormFocus::NewComment => FormFocus::Title,
         }
     }
 
     fn compute_prev(&self, cur: FormFocus) -> FormFocus {
         match cur {
-            FormFocus::Title => FormFocus::NewStep,
+            FormFocus::Title => FormFocus::NewComment,
             FormFocus::Status => FormFocus::Title,
             FormFocus::Description => FormFocus::Status,
             FormFocus::Step(i) => match self.prev_visible_step(i) {
@@ -401,11 +366,11 @@ impl FeatureForm {
             },
             FormFocus::Comment(i) => match self.prev_visible_comment(i) {
                 Some(prev) => FormFocus::Comment(prev),
-                None => FormFocus::NewComment,
+                None => FormFocus::NewStep,
             },
             FormFocus::NewComment => match self.last_visible_comment() {
                 Some(last) => FormFocus::Comment(last),
-                None => FormFocus::NewComment,
+                None => FormFocus::NewStep,
             },
         }
     }
@@ -451,23 +416,14 @@ impl FeatureForm {
         }
     }
 
-    pub fn status_cursor_right(&mut self) {
-        self.status_cursor = self.status_cursor.next();
-    }
-
-    pub fn status_cursor_left(&mut self) {
-        self.status_cursor = self.status_cursor.prev();
-    }
-
-    pub fn apply_status_cursor(&mut self) {
-        if self.status != self.status_cursor {
-            self.status = self.status_cursor;
-            self.dirty = true;
-        }
-    }
-
     pub fn cycle_status(&mut self) {
         self.status = self.status.next();
+        self.status_cursor = self.status;
+        self.dirty = true;
+    }
+
+    pub fn cycle_status_prev(&mut self) {
+        self.status = self.status.prev();
         self.status_cursor = self.status;
         self.dirty = true;
     }
