@@ -280,6 +280,16 @@ pub struct PrInfo {
     pub url: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub is_bare: bool,
+    pub is_detached: bool,
+    pub is_locked: bool,
+}
+
 pub fn current_branch(repo: &Path) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -534,6 +544,84 @@ pub fn pr_create(repo: &Path, title: &str, body: &str) -> Result<String, String>
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+pub fn list_worktrees(repo: &Path) -> Vec<WorktreeInfo> {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    parse_worktree_porcelain(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeInfo> {
+    let mut out = Vec::new();
+    let mut cur: Option<WorktreeInfo> = None;
+    for line in text.lines() {
+        if line.is_empty() {
+            if let Some(w) = cur.take() {
+                out.push(w);
+            }
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(w) = cur.take() {
+                out.push(w);
+            }
+            cur = Some(WorktreeInfo {
+                path: PathBuf::from(path.trim()),
+                branch: None,
+                head: None,
+                is_bare: false,
+                is_detached: false,
+                is_locked: false,
+            });
+        } else if let Some(w) = cur.as_mut() {
+            if let Some(sha) = line.strip_prefix("HEAD ") {
+                w.head = Some(sha.trim().to_string());
+            } else if let Some(branch) = line.strip_prefix("branch ") {
+                let b = branch.trim().strip_prefix("refs/heads/").unwrap_or(branch.trim());
+                w.branch = Some(b.to_string());
+            } else if line == "bare" {
+                w.is_bare = true;
+            } else if line == "detached" {
+                w.is_detached = true;
+            } else if line.starts_with("locked") {
+                w.is_locked = true;
+            }
+        }
+    }
+    if let Some(w) = cur.take() {
+        out.push(w);
+    }
+    out
+}
+
+pub fn add_worktree(repo: &Path, path: &Path, branch: &str, create_branch: bool) -> Result<String, String> {
+    let path_str = path.to_string_lossy().to_string();
+    let args: Vec<&str> = if create_branch {
+        vec!["worktree", "add", "-b", branch, &path_str]
+    } else {
+        vec!["worktree", "add", &path_str, branch]
+    };
+    run_git_output(repo, &args)
+}
+
+pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<String, String> {
+    let path_str = path.to_string_lossy().to_string();
+    let args: Vec<&str> = if force {
+        vec!["worktree", "remove", "--force", &path_str]
+    } else {
+        vec!["worktree", "remove", &path_str]
+    };
+    run_git_output(repo, &args)
+}
+
 pub fn detect_github_url(project_path: &Path) -> Option<String> {
     let config = std::fs::read_to_string(project_path.join(".git").join("config")).ok()?;
     extract_origin_url(&config).and_then(|raw| normalize_github_url(&raw))
@@ -634,5 +722,21 @@ mod tests {
         let cfg = "[remote \"origin\"]\n    url = git@gitlab.com:me/repo.git\n";
         let raw = extract_origin_url(cfg).unwrap();
         assert_eq!(normalize_github_url(&raw), None);
+    }
+
+    #[test]
+    fn parses_worktree_porcelain() {
+        let text = "worktree /repo/main\nHEAD abc123\nbranch refs/heads/main\n\n\
+                    worktree /repo/wt-foo\nHEAD def456\nbranch refs/heads/feature/foo\nlocked\n\n\
+                    worktree /repo/wt-detached\nHEAD 999000\ndetached\n";
+        let wts = parse_worktree_porcelain(text);
+        assert_eq!(wts.len(), 3);
+        assert_eq!(wts[0].path, PathBuf::from("/repo/main"));
+        assert_eq!(wts[0].branch.as_deref(), Some("main"));
+        assert!(!wts[0].is_locked);
+        assert_eq!(wts[1].branch.as_deref(), Some("feature/foo"));
+        assert!(wts[1].is_locked);
+        assert!(wts[2].is_detached);
+        assert!(wts[2].branch.is_none());
     }
 }

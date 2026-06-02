@@ -1,4 +1,4 @@
-use crate::git::{BranchInfo, CommitInfo, PrInfo};
+use crate::git::{BranchInfo, CommitInfo, PrInfo, WorktreeInfo};
 use ratatui::layout::Rect;
 use std::path::PathBuf;
 
@@ -16,6 +16,7 @@ pub enum DetailsMode {
     Commit,
     PrList,
     PrView,
+    Worktrees,
 }
 
 pub struct GitTreeView {
@@ -23,11 +24,13 @@ pub struct GitTreeView {
     pub branches: Vec<BranchInfo>,
     pub commits: Vec<CommitInfo>,
     pub prs: Vec<PrInfo>,
+    pub worktrees: Vec<WorktreeInfo>,
     pub current_branch: Option<String>,
     pub focus: GitPane,
     pub branch_idx: usize,
     pub commit_idx: usize,
     pub pr_idx: usize,
+    pub worktree_idx: usize,
     pub details_mode: DetailsMode,
     pub details_text: String,
     pub details_scroll: u16,
@@ -44,11 +47,13 @@ impl GitTreeView {
             branches: Vec::new(),
             commits: Vec::new(),
             prs: Vec::new(),
+            worktrees: Vec::new(),
             current_branch: None,
             focus: GitPane::Branches,
             branch_idx: 0,
             commit_idx: 0,
             pr_idx: 0,
+            worktree_idx: 0,
             details_mode: DetailsMode::Commit,
             details_text: String::new(),
             details_scroll: 0,
@@ -169,19 +174,77 @@ impl GitTreeView {
     }
 
     pub fn back_to_pr_list(&mut self) {
-        if matches!(self.details_mode, DetailsMode::PrView) {
-            self.details_mode = DetailsMode::PrList;
-            self.details_scroll = 0;
-            self.details_text = self.render_pr_list_text();
-            let label = self
-                .branches
-                .get(self.branch_idx)
-                .map(|b| b.name.strip_prefix("origin/").unwrap_or(&b.name).to_string())
-                .unwrap_or_default();
-            self.details_title = format!("PRs for {}", label);
-        } else if matches!(self.details_mode, DetailsMode::PrList) {
-            self.load_selected_commit_details();
+        match self.details_mode {
+            DetailsMode::PrView => {
+                self.details_mode = DetailsMode::PrList;
+                self.details_scroll = 0;
+                self.details_text = self.render_pr_list_text();
+                let label = self
+                    .branches
+                    .get(self.branch_idx)
+                    .map(|b| b.name.strip_prefix("origin/").unwrap_or(&b.name).to_string())
+                    .unwrap_or_default();
+                self.details_title = format!("PRs for {}", label);
+            }
+            DetailsMode::PrList | DetailsMode::Worktrees => self.load_selected_commit_details(),
+            DetailsMode::Commit => {}
         }
+    }
+
+    pub fn load_worktrees(&mut self) {
+        self.worktrees = crate::git::list_worktrees(&self.root);
+        if self.worktree_idx >= self.worktrees.len() {
+            self.worktree_idx = self.worktrees.len().saturating_sub(1);
+        }
+        self.details_mode = DetailsMode::Worktrees;
+        self.details_scroll = 0;
+        self.details_title = "Worktrees".into();
+        self.details_text = self.render_worktrees_text();
+    }
+
+    fn render_worktrees_text(&self) -> String {
+        if self.worktrees.is_empty() {
+            return "(no worktrees — press 'n' to create one)".to_string();
+        }
+        let mut out = String::new();
+        out.push_str("Worktrees (Enter to open as project • n new • D delete)\n\n");
+        for (i, wt) in self.worktrees.iter().enumerate() {
+            let marker = if i == self.worktree_idx { "▶" } else { " " };
+            let branch = wt
+                .branch
+                .clone()
+                .unwrap_or_else(|| if wt.is_detached { "(detached)".into() } else { "(none)".into() });
+            let lock = if wt.is_locked { " [locked]" } else { "" };
+            let bare = if wt.is_bare { " [bare]" } else { "" };
+            let head = wt.head.as_deref().map(|h| &h[..h.len().min(7)]).unwrap_or("-------");
+            out.push_str(&format!(
+                "{} {}{}{}\n      branch: {}  head: {}\n",
+                marker,
+                wt.path.display(),
+                lock,
+                bare,
+                branch,
+                head,
+            ));
+        }
+        out
+    }
+
+    pub fn selected_worktree(&self) -> Option<&WorktreeInfo> {
+        self.worktrees.get(self.worktree_idx)
+    }
+
+    pub fn remove_selected_worktree(&mut self, force: bool) -> Result<String, String> {
+        let path = self
+            .worktrees
+            .get(self.worktree_idx)
+            .map(|w| w.path.clone())
+            .ok_or_else(|| "No worktree selected".to_string())?;
+        let result = crate::git::remove_worktree(&self.root, &path, force);
+        if result.is_ok() {
+            self.load_worktrees();
+        }
+        result
     }
 
     pub fn cycle_pane(&mut self, forward: bool) {
@@ -215,13 +278,20 @@ impl GitTreeView {
     }
 
     fn details_move_down(&mut self) {
-        if matches!(self.details_mode, DetailsMode::PrList) && !self.prs.is_empty() {
-            if self.pr_idx + 1 < self.prs.len() {
-                self.pr_idx += 1;
-                self.details_text = self.render_pr_list_text();
+        match self.details_mode {
+            DetailsMode::PrList if !self.prs.is_empty() => {
+                if self.pr_idx + 1 < self.prs.len() {
+                    self.pr_idx += 1;
+                    self.details_text = self.render_pr_list_text();
+                }
             }
-        } else {
-            self.details_scroll = self.details_scroll.saturating_add(1);
+            DetailsMode::Worktrees if !self.worktrees.is_empty() => {
+                if self.worktree_idx + 1 < self.worktrees.len() {
+                    self.worktree_idx += 1;
+                    self.details_text = self.render_worktrees_text();
+                }
+            }
+            _ => self.details_scroll = self.details_scroll.saturating_add(1),
         }
     }
 
@@ -245,13 +315,20 @@ impl GitTreeView {
     }
 
     fn details_move_up(&mut self) {
-        if matches!(self.details_mode, DetailsMode::PrList) && !self.prs.is_empty() {
-            if self.pr_idx > 0 {
-                self.pr_idx -= 1;
-                self.details_text = self.render_pr_list_text();
+        match self.details_mode {
+            DetailsMode::PrList if !self.prs.is_empty() => {
+                if self.pr_idx > 0 {
+                    self.pr_idx -= 1;
+                    self.details_text = self.render_pr_list_text();
+                }
             }
-        } else {
-            self.details_scroll = self.details_scroll.saturating_sub(1);
+            DetailsMode::Worktrees if !self.worktrees.is_empty() => {
+                if self.worktree_idx > 0 {
+                    self.worktree_idx -= 1;
+                    self.details_text = self.render_worktrees_text();
+                }
+            }
+            _ => self.details_scroll = self.details_scroll.saturating_sub(1),
         }
     }
 
