@@ -25,12 +25,17 @@ storing project state, open tabs, and feature metadata.
 - **Embedded terminals** (PowerShell on Windows, bash elsewhere) with a real
   PTY and scrollback.
 - **Per-project Claude agent sessions** with conversation resume.
-- **Git view** — branches, commits, `gh` integration for pull requests.
+- **Git view** — branches, commits, `gh` integration for pull requests,
+  and `git worktree` management (list / create / delete / open).
 - **Project view** — project meta (About / Conventions / AI Hints / AI Notes)
   plus a feature list with steps and comments.
+- **Runtime view** — declare services in `CoffeeTable.Runtime.yaml` and start,
+  stop, restart, or build them from inside the app. Streams stdout/stderr into
+  a tagged shared log (filter to one service) and shows PID + CPU / RAM /
+  disk-IO per process.
 - **AI commit** (`<Space>C`) — generates a commit message via Claude CLI,
   lets you review and confirm.
-- **Vim-style command palette** (`:`) — `:w`, `:q`, `:e`, `:S`, `:H`, `:D`…
+- **Vim-style command palette** (`Ctrl+P`) — `:w`, `:q`, `:e`, `:S`, `:H`, `:D`…
 
 ## Requirements
 
@@ -120,7 +125,7 @@ You can open the file from inside the app with `:S` (or `:settings`).
 | Key           | Action |
 |---------------|--------|
 | `Space`       | Leader — opens the quick-action menu |
-| `:`           | Command palette (Vim-style) |
+| `Ctrl+P`      | Command palette (Vim-style) |
 | `?`           | Help |
 | `Ctrl+J / K`  | Switch active project tab |
 | `q`           | Quit (from Normal mode) |
@@ -143,6 +148,7 @@ You can open the file from inside the app with `:S` (or `:settings`).
 | `T` | New terminal |
 | `P` | Project view (meta + features) |
 | `G` | Git view (branches + commits) |
+| `r` | Runtime view (services defined in `CoffeeTable.Runtime.yaml`) |
 | `a` | Agent for the selected feature |
 | `z` | Toggle wrap (none / 120 / 80) |
 
@@ -157,7 +163,7 @@ Keys behave like Vim. Basics:
 - `/` search, `n` / `N` next / previous
 - `Ctrl+S` save
 
-Command palette (`:`):
+Command palette (`Ctrl+P`):
 
 | Command | Aliases       | Action |
 |---------|---------------|--------|
@@ -173,6 +179,11 @@ Command palette (`:`):
 | `:H`    | `:head`       | HEAD version |
 | `:W`    | `:working`    | Back to working copy |
 | `:D`    | `:diff`       | Diff vs HEAD |
+| `:runtime` |            | Switch to the Runtime view |
+| `:run [name]`  |        | Run all services (or just `name`) |
+| `:stop [name]` |        | Stop all services (or just `name`) |
+| `:build [name]` |       | Run the build step for all services (or `name`) |
+| `:restart [name]` |     | Stop + start (all or `name`) |
 
 ### Terminal
 
@@ -181,16 +192,103 @@ CoffeeTable action, use the prefix **`Ctrl+Space`** — a menu of letters pops
 up (e.g. `Ctrl+Space d` = detach back to the editor, `Ctrl+Space n` = new
 tab, `Ctrl+Space x` = close current tab).
 
+### Agents
+
+Same `Ctrl+Space` prefix as the terminal, scoped to agent sessions:
+
+| Keys | Action |
+|------|--------|
+| `Ctrl+Space n` | New agent session in the active project |
+| `Ctrl+Space x` | **Close** the active agent — kills the child process and forgets the saved session id |
+| `Ctrl+Space r` | Rename the active agent |
+| `Ctrl+Space h / l` (or `Ctrl+H / Ctrl+L`) | Switch between agent tabs |
+| `Ctrl+Space d` | Detach back to the editor view |
+
+### Git view
+
+| Key | Action |
+|-----|--------|
+| `j / k`, `↓ / ↑` | Move within the focused pane |
+| `Tab` / `Shift+Tab` | Cycle panes (branches → commits → details) |
+| `Enter` / `l` | Drill in (branch → commits → commit details / PR view / open worktree) |
+| `Esc` / `Backspace` | Back out of PR view → PR list → commit details |
+| `c` | Checkout selected branch |
+| `p` / `P` | Push (auto sets upstream) / pull (`--ff-only`) |
+| `m` | Merge selected branch into current |
+| `R` / `V` | Create PR (uses HEAD subject as title) / list PRs for the selected branch |
+| `W` | Show worktrees in the details pane |
+| `n` | Create a new worktree (prompts for branch name; path is `<repo>-<branch>` next to the repo) |
+| `D` | Delete the selected worktree (auto-retries with `--force` if needed) |
+| `Enter` on a worktree | Open it as a project tab (switches if already open) |
+| `r` | Refresh branches + commits |
+
 ## Views
 
-Each project has five views (tabs at the top, leader shortcuts `P`, `G`, `t`):
+Each project has the following views (tabs at the top, leader shortcuts
+`P`, `G`, `t`, `r`):
 
 - **Editor** — tree / changes on the left, editor on the right.
 - **Terminal** — multiple terminal tabs per project.
 - **Agents** — per-project Claude agent sessions, with resume.
 - **Project** — project description (About, Conventions, AI Hints, AI Notes)
   and a list of features (status, description, steps, comments).
+- **Runtime** — service supervisor. Reads `CoffeeTable.Runtime.yaml` from the
+  project root; see [Runtime view](#runtime-view) below.
 - **Git** — branch tree, commit list, `gh` integration for PRs.
+
+## Runtime view
+
+Drop a `CoffeeTable.Runtime.yaml` at the root of a project to declare the
+services that make it up. The Runtime view (`Space r`) then lets you start,
+stop, restart, or build those services and streams their output into a
+shared, tagged log.
+
+```yaml
+services:
+  - name: api
+    command: dotnet run --project src/Api
+    build: dotnet build src/Api
+    env:
+      ASPNETCORE_ENVIRONMENT: Development
+
+  - name: web
+    command: npm run dev
+    cwd: web
+    depends_on: [api]
+    build: npm run build
+```
+
+Per service:
+
+- `name` — unique identifier shown in the list and used to tag log lines.
+- `command` — the foreground process to run (whitespace-split argv;
+  use quotes for arguments with spaces).
+- `cwd` — optional, relative to the project root.
+- `build` — optional one-shot build command; runs and waits to completion.
+- `depends_on` — services that must start before this one.
+- `env` — extra environment variables.
+
+### Controls (inside the Runtime view)
+
+| Key | Action |
+|-----|--------|
+| `j / k`, `↓ / ↑` | Move selection |
+| `g / G`          | First / last service |
+| `Enter` or `f`   | Toggle output filter to the selected service |
+| `Esc`            | Clear output filter |
+| `c`              | Clear the output buffer |
+| `e`              | Reload `CoffeeTable.Runtime.yaml` |
+| `r` / `R`        | Run selected service / run all (dependencies first) |
+| `s` / `S`        | Stop selected / stop all |
+| `b` / `B`        | Build selected / build all |
+| `x` / `X`        | Restart (stop + start) selected / all |
+
+The same actions are available from the command palette
+(`:run`, `:stop`, `:build`, `:restart`) with an optional service-name argument.
+
+For each running process the list shows the PID along with current CPU %,
+RAM, and cumulative disk-IO (sampled via `sysinfo`). GPU usage is not yet
+reported.
 
 ## AI / Claude
 

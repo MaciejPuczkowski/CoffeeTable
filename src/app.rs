@@ -1,5 +1,5 @@
 use crate::{
-    config::{self, Settings},
+    config::{self, ProjectSettings, Settings},
     db::Db,
     discovery, git,
     project::Project,
@@ -16,7 +16,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 
 pub enum AppMode {
@@ -28,6 +30,54 @@ pub enum AppMode {
     Palette,
     ExplorerFilter,
     AiCommit,
+    AgentRename,
+    WorktreePrompt,
+    FilePrompt,
+    ConfirmDeleteFile,
+    Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPane {
+    Global,
+    Project,
+}
+
+pub struct SettingsOverlay {
+    pub global: EditorView,
+    pub project: EditorView,
+    pub focus: SettingsPane,
+    pub project_id: Option<i64>,
+    pub project_path: Option<PathBuf>,
+    pub status: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FilePromptKind {
+    NewFile,
+    NewDir,
+    Rename,
+}
+
+pub struct FilePromptState {
+    pub kind: FilePromptKind,
+    pub parent: PathBuf,
+    pub source: Option<PathBuf>,
+    pub buffer: String,
+    pub cursor: usize,
+}
+
+pub struct AgentRenameState {
+    pub project_id: i64,
+    pub agent_idx: usize,
+    pub buffer: String,
+    pub cursor: usize,
+}
+
+pub struct WorktreePromptState {
+    pub project_id: i64,
+    pub buffer: String,
+    pub cursor: usize,
 }
 
 pub enum AiResult {
@@ -74,10 +124,34 @@ pub enum Focus {
     Editor,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FocusContext {
+    ProjectTabs,
+    ViewTabs,
+    SubTabs,
+    Body,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NavDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LeftPaneMode {
     Tree,
     Changes,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeAction {
+    Run,
+    Stop,
+    Build,
+    Restart,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,6 +161,8 @@ pub enum ViewMode {
     Project,
     Agents,
     Git,
+    Github,
+    Runtime,
 }
 
 pub struct ProjectViewState {
@@ -104,6 +180,10 @@ pub struct ProjectViewState {
     pub view_mode: ViewMode,
     pub project_view: Option<crate::views::project_view::ProjectViewModel>,
     pub git_view: Option<crate::views::git::GitTreeView>,
+    pub github_view: Option<crate::views::github::GithubView>,
+    pub github_available: Option<bool>,
+    pub runtime: Option<crate::runtime::Runtime>,
+    pub branch: Option<String>,
 }
 
 impl ProjectViewState {
@@ -128,6 +208,8 @@ pub struct App {
     pub search_excludes: Vec<String>,
     pub ai_config: crate::config::AiConfig,
     pub shell_config: crate::config::ShellConfig,
+    pub project_settings_yaml: HashMap<i64, String>,
+    pub runtime_yaml: HashMap<i64, String>,
     pub open_projects: Vec<Project>,
     pub active_index: usize,
     pub project_views: HashMap<i64, ProjectViewState>,
@@ -136,6 +218,7 @@ pub struct App {
     pub grep: Option<GrepView>,
     pub palette: Option<PaletteState>,
     pub ai_commit: Option<AiCommitOverlay>,
+    pub settings_overlay: Option<SettingsOverlay>,
     pub pending_open: Option<PendingOpen>,
     pub pending_delete_feature: Option<(i64, String)>,
     pub should_quit: bool,
@@ -155,13 +238,26 @@ pub struct App {
     pub agent_new_rect: Option<Rect>,
     pub left_pane_area: Rect,
     pub right_pane_area: Rect,
+    pub runtime_list_area: Rect,
     pub project_list_inner: Rect,
-    pub feature_form_tab_rects: Vec<(crate::views::feature_form::FormPage, Rect)>,
     pub feature_form_field_rects: Vec<(crate::views::feature_form::FormFocus, Rect)>,
     pub feature_form_status_rects: Vec<(crate::project::FeatureStatus, Rect)>,
     pub agent_lane_visible: bool,
     pub agent_lane_area: Rect,
     pub agent_lane_tile_rects: Vec<(i64, usize, Rect)>,
+    pub agent_lane_width: u16,
+    pub lane_dragging: bool,
+    pub agent_rename: Option<AgentRenameState>,
+    pub worktree_prompt: Option<WorktreePromptState>,
+    pub file_prompt: Option<FilePromptState>,
+    pub file_yank: Option<PathBuf>,
+    pub pending_delete_file: Option<PathBuf>,
+    pub split_pct: u16,
+    pub split_dragging: bool,
+    pub focus_context: FocusContext,
+    pub tab_chord: Option<Instant>,
+    pub last_disk_poll: Option<Instant>,
+    pub token_usage: Arc<Mutex<crate::token_usage::TokenSnapshot>>,
 }
 
 impl App {
@@ -183,6 +279,7 @@ impl App {
             .unwrap_or(0);
 
         let mut project_views: HashMap<i64, ProjectViewState> = HashMap::new();
+        let mut project_settings_yaml: HashMap<i64, String> = HashMap::new();
         for p in &open_projects {
             let state = db.load_file_tree_state(p.id)?;
             let status = git::fetch_status(&p.path);
@@ -190,6 +287,9 @@ impl App {
             tree.set_git_status(status.clone());
             let mut changes = ChangesView::new(p.path.clone());
             changes.set_status(&status);
+            let yaml = db.load_project_settings_yaml(p.id)?.unwrap_or_default();
+            project_settings_yaml.insert(p.id, yaml);
+            let branch = git::current_branch(&p.path);
             project_views.insert(
                 p.id,
                 ProjectViewState {
@@ -207,6 +307,10 @@ impl App {
                     view_mode: ViewMode::Editor,
                     project_view: None,
                     git_view: None,
+                    github_view: None,
+                    github_available: None,
+                    runtime: None,
+                    branch,
                 },
             );
         }
@@ -230,6 +334,8 @@ impl App {
             search_excludes,
             ai_config,
             shell_config,
+            project_settings_yaml,
+            runtime_yaml: HashMap::new(),
             open_projects,
             active_index,
             project_views,
@@ -238,6 +344,7 @@ impl App {
             grep: None,
             palette: None,
             ai_commit: None,
+            settings_overlay: None,
             pending_open: None,
             pending_delete_feature: None,
             should_quit: false,
@@ -257,13 +364,30 @@ impl App {
             agent_new_rect: None,
             left_pane_area: Rect::default(),
             right_pane_area: Rect::default(),
+            runtime_list_area: Rect::default(),
             project_list_inner: Rect::default(),
-            feature_form_tab_rects: Vec::new(),
             feature_form_field_rects: Vec::new(),
             feature_form_status_rects: Vec::new(),
             agent_lane_visible: true,
             agent_lane_area: Rect::default(),
             agent_lane_tile_rects: Vec::new(),
+            agent_lane_width: 36,
+            lane_dragging: false,
+            agent_rename: None,
+            worktree_prompt: None,
+            file_prompt: None,
+            file_yank: None,
+            pending_delete_file: None,
+            split_pct: 30,
+            split_dragging: false,
+            focus_context: FocusContext::Body,
+            tab_chord: None,
+            last_disk_poll: None,
+            token_usage: {
+                let state = Arc::new(Mutex::new(crate::token_usage::TokenSnapshot::default()));
+                crate::token_usage::start_background_scanner(state.clone());
+                state
+            },
         })
     }
 
@@ -290,6 +414,18 @@ impl App {
             self.leader_pending = false;
             self.handle_leader_key(key)?;
             return Ok(());
+        }
+        if matches!(self.mode, AppMode::AgentRename) {
+            return self.on_key_agent_rename(key);
+        }
+        if matches!(self.mode, AppMode::WorktreePrompt) {
+            return self.on_key_worktree_prompt(key);
+        }
+        if matches!(self.mode, AppMode::FilePrompt) {
+            return self.on_key_file_prompt(key);
+        }
+        if matches!(self.mode, AppMode::ConfirmDeleteFile) {
+            return self.on_key_confirm_delete_file(key);
         }
         if self.is_help_key(key) {
             self.help_visible = true;
@@ -324,8 +460,8 @@ impl App {
             self.leader_pending = true;
             return Ok(());
         }
-        if key.code == KeyCode::Char(':')
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        if key.code == KeyCode::Char('p')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
             && self.should_open_palette()
         {
             self.open_palette();
@@ -339,6 +475,11 @@ impl App {
             AppMode::Palette => self.on_key_palette(key)?,
             AppMode::ExplorerFilter => self.on_key_explorer_filter(key)?,
             AppMode::AiCommit => self.on_key_ai_commit(key)?,
+            AppMode::AgentRename => self.on_key_agent_rename(key)?,
+            AppMode::WorktreePrompt => self.on_key_worktree_prompt(key)?,
+            AppMode::FilePrompt => self.on_key_file_prompt(key)?,
+            AppMode::ConfirmDeleteFile => self.on_key_confirm_delete_file(key)?,
+            AppMode::Settings => self.on_key_settings(key)?,
             AppMode::Normal => self.on_key_normal(key)?,
         }
         Ok(())
@@ -433,6 +574,23 @@ impl App {
             Some(rest) => (rest, true),
             None => (cmd, false),
         };
+        let trimmed = base.trim();
+        if let Some(rest) = match_runtime_keyword(trimmed, "run") {
+            self.palette_runtime_action(RuntimeAction::Run, &rest);
+            return Ok(());
+        }
+        if let Some(rest) = match_runtime_keyword(trimmed, "stop") {
+            self.palette_runtime_action(RuntimeAction::Stop, &rest);
+            return Ok(());
+        }
+        if let Some(rest) = match_runtime_keyword(trimmed, "build") {
+            self.palette_runtime_action(RuntimeAction::Build, &rest);
+            return Ok(());
+        }
+        if let Some(rest) = match_runtime_keyword(trimmed, "restart") {
+            self.palette_runtime_action(RuntimeAction::Restart, &rest);
+            return Ok(());
+        }
         match base {
             "w" | "write" => self.palette_save(),
             "q" | "close" => self.palette_close_editor(force),
@@ -450,6 +608,14 @@ impl App {
             "W" | "working" | "work" | "new" => self.palette_show_working(),
             "D" | "diff" => self.palette_show_diff(),
             "L" | "lane" => self.toggle_agent_lane(),
+            "R" | "rename" => self.start_rename_active_agent(),
+            "runtime" => {
+                let _ = self.open_runtime_view();
+            }
+            "import-settings" | "psi" => self.palette_import_project_settings(),
+            "export-settings" | "pse" => self.palette_export_project_settings(),
+            "import-runtime" | "rti" => self.palette_import_runtime(),
+            "export-runtime" | "rte" => self.palette_export_runtime(),
             "" => {}
             other => self.status = format!("Not a command: {}", other),
         }
@@ -723,6 +889,8 @@ impl App {
             KeyCode::Char('T') => self.new_terminal()?,
             KeyCode::Char('P') => self.open_project_view()?,
             KeyCode::Char('G') => self.open_git_view()?,
+            KeyCode::Char('H') => self.open_github_view()?,
+            KeyCode::Char('r') => self.open_runtime_view()?,
             KeyCode::Char('a') => self.agent_for_selected_feature()?,
             KeyCode::Char('L') => self.toggle_agent_lane(),
             KeyCode::Char('z') => self.cycle_editor_wrap(),
@@ -769,9 +937,11 @@ impl App {
             return Ok(());
         };
         let status = git::fetch_status(&project.path);
+        let branch = git::current_branch(&project.path);
         if let Some(state) = self.project_views.get_mut(&project.id) {
             state.tree.set_git_status(status.clone());
             state.changes.set_status(&status);
+            state.branch = branch;
         }
         Ok(())
     }
@@ -842,10 +1012,18 @@ impl App {
         let in_right = contains(self.right_pane_area, col, row);
         let in_lane = self.agent_lane_visible && contains(self.agent_lane_area, col, row);
 
+        if self.handle_lane_mouse(ev, col, row) {
+            return Ok(());
+        }
+
         if in_lane {
             if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
                 self.click_agent_lane(col, row);
             }
+            return Ok(());
+        }
+
+        if self.handle_split_mouse(ev, col, row) {
             return Ok(());
         }
 
@@ -932,11 +1110,13 @@ impl App {
                             return Ok(());
                         }
                     }
+                } else if self.try_pty_mouse_press(col, row) {
+                    // routed to terminal/agent selection
                 } else if in_left {
-                    if matches!(self.current_view_mode(), Some(ViewMode::Project)) {
-                        self.click_project_list(col, row);
-                    } else {
-                        self.click_left_pane(col, row)?;
+                    match self.current_view_mode() {
+                        Some(ViewMode::Project) => self.click_project_list(col, row),
+                        Some(ViewMode::Runtime) => self.click_runtime_list(col, row),
+                        _ => self.click_left_pane(col, row)?,
                     }
                 } else if in_right {
                     if matches!(self.current_view_mode(), Some(ViewMode::Project)) {
@@ -947,7 +1127,9 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if in_right {
+                if self.try_pty_mouse_drag(col, row) {
+                    // routed
+                } else if in_right {
                     if matches!(self.current_view_mode(), Some(ViewMode::Project)) {
                         if let Some(model) = self
                             .active_state()
@@ -965,7 +1147,9 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if in_right {
+                if self.try_pty_mouse_release() {
+                    // routed
+                } else if in_right {
                     if matches!(self.current_view_mode(), Some(ViewMode::Project)) {
                         let status = {
                             let Some(model) = self
@@ -999,6 +1183,83 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn handle_lane_mouse(&mut self, ev: MouseEvent, col: u16, row: u16) -> bool {
+        if !self.agent_lane_visible || self.agent_lane_area.width == 0 {
+            if matches!(ev.kind, MouseEventKind::Up(MouseButton::Left)) && self.lane_dragging {
+                self.lane_dragging = false;
+                return true;
+            }
+            return false;
+        }
+        let lane = self.agent_lane_area;
+        let in_rows = row >= lane.y && row < lane.y.saturating_add(lane.height);
+        let boundary = lane.x;
+        let near = in_rows && col + 1 >= boundary && col <= boundary;
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) if near => {
+                self.lane_dragging = true;
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.lane_dragging => {
+                let max_x = lane.x.saturating_add(lane.width);
+                let body_start = self
+                    .left_pane_area
+                    .x
+                    .min(self.right_pane_area.x.min(self.tabs_area.x));
+                let min_lane: u16 = 20;
+                let max_lane = max_x.saturating_sub(body_start.saturating_add(24));
+                let mut new_w = max_x.saturating_sub(col);
+                if max_lane >= min_lane {
+                    new_w = new_w.clamp(min_lane, max_lane);
+                } else {
+                    new_w = new_w.max(min_lane);
+                }
+                self.agent_lane_width = new_w;
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.lane_dragging => {
+                self.lane_dragging = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_split_mouse(&mut self, ev: MouseEvent, col: u16, row: u16) -> bool {
+        let left = self.left_pane_area;
+        let right = self.right_pane_area;
+        if left.width == 0 || right.width == 0 {
+            if matches!(ev.kind, MouseEventKind::Up(MouseButton::Left)) && self.split_dragging {
+                self.split_dragging = false;
+                return true;
+            }
+            return false;
+        }
+        let boundary = left.x.saturating_add(left.width);
+        let in_rows = row >= left.y && row < left.y.saturating_add(left.height);
+        let near = in_rows && col + 1 >= boundary && col <= boundary;
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) if near => {
+                self.split_dragging = true;
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.split_dragging => {
+                let total = left.width.saturating_add(right.width);
+                if total > 0 {
+                    let rel = col.saturating_sub(left.x).min(total);
+                    let pct = ((rel as u32 * 100) / total as u32).clamp(10, 90) as u16;
+                    self.split_pct = pct;
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.split_dragging => {
+                self.split_dragging = false;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn tab_at(&self, col: u16, row: u16) -> Option<usize> {
@@ -1040,6 +1301,95 @@ impl App {
         }
         self.persist_active_tree()?;
         Ok(())
+    }
+
+    fn try_pty_mouse_press(&mut self, col: u16, row: u16) -> bool {
+        let mode = self.current_view_mode();
+        match mode {
+            Some(ViewMode::Terminal) => {
+                let Some(state) = self.active_state() else { return false };
+                let Some(idx) = state.active_terminal else { return false };
+                let Some(term) = state.terminals.get_mut(idx) else { return false };
+                let Some(area) = term.last_render_area else { return false };
+                if !contains(area, col, row) {
+                    return false;
+                }
+                term.mouse_press(area, col, row);
+                true
+            }
+            Some(ViewMode::Agents) => {
+                let Some(state) = self.active_state() else { return false };
+                let Some(idx) = state.active_agent else { return false };
+                let Some(agent) = state.agents.get_mut(idx) else { return false };
+                let Some(area) = agent.last_render_area else { return false };
+                if !contains(area, col, row) {
+                    return false;
+                }
+                agent.mouse_press(area, col, row);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn try_pty_mouse_drag(&mut self, col: u16, row: u16) -> bool {
+        let mode = self.current_view_mode();
+        match mode {
+            Some(ViewMode::Terminal) => {
+                let Some(state) = self.active_state() else { return false };
+                let Some(idx) = state.active_terminal else { return false };
+                let Some(term) = state.terminals.get_mut(idx) else { return false };
+                if term.drag_anchor.is_none() {
+                    return false;
+                }
+                let Some(area) = term.last_render_area else { return false };
+                term.mouse_drag(area, col, row);
+                true
+            }
+            Some(ViewMode::Agents) => {
+                let Some(state) = self.active_state() else { return false };
+                let Some(idx) = state.active_agent else { return false };
+                let Some(agent) = state.agents.get_mut(idx) else { return false };
+                if agent.drag_anchor.is_none() {
+                    return false;
+                }
+                let Some(area) = agent.last_render_area else { return false };
+                agent.mouse_drag(area, col, row);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn try_pty_mouse_release(&mut self) -> bool {
+        let mode = self.current_view_mode();
+        let text = match mode {
+            Some(ViewMode::Terminal) => {
+                let Some(state) = self.active_state() else { return false };
+                let Some(idx) = state.active_terminal else { return false };
+                let Some(term) = state.terminals.get_mut(idx) else { return false };
+                if term.drag_anchor.is_none() && term.selection.is_none() {
+                    return false;
+                }
+                term.mouse_release()
+            }
+            Some(ViewMode::Agents) => {
+                let Some(state) = self.active_state() else { return false };
+                let Some(idx) = state.active_agent else { return false };
+                let Some(agent) = state.agents.get_mut(idx) else { return false };
+                if agent.drag_anchor.is_none() && agent.selection.is_none() {
+                    return false;
+                }
+                agent.mouse_release()
+            }
+            _ => return false,
+        };
+        if let Some(t) = text {
+            let chars = t.chars().count();
+            crate::clipboard::copy(&t);
+            self.status = format!("Copied {} chars", chars);
+        }
+        true
     }
 
     fn click_agent_lane(&mut self, col: u16, row: u16) {
@@ -1186,6 +1536,20 @@ impl App {
         self.active_state_ref().map(|s| s.view_mode)
     }
 
+    fn click_runtime_list(&mut self, col: u16, row: u16) {
+        let area = self.runtime_list_area;
+        let count = self
+            .active_state_ref()
+            .and_then(|s| s.runtime.as_ref())
+            .map(|r| r.services.len())
+            .unwrap_or(0);
+        let Some(idx) = crate::views::runtime::service_index_at_row(area, row, count) else {
+            return;
+        };
+        let _ = col;
+        self.with_runtime(|r| r.select_index(idx));
+    }
+
     fn click_project_list(&mut self, _col: u16, row: u16) {
         let inner = self.project_list_inner;
         if !contains(inner, _col, row) {
@@ -1222,28 +1586,14 @@ impl App {
         if let Some(state) = self.active_state() {
             state.focus = Focus::Editor;
         }
-        let tab_hit = self
-            .feature_form_tab_rects
-            .iter()
-            .find(|(_, r)| contains(*r, col, row))
-            .map(|(p, _)| *p);
-        if let Some(page) = tab_hit {
-            use crate::views::feature_form::FormPage;
-            self.with_feature_form(|f| match page {
-                FormPage::Details => f.switch_to_details(),
-                FormPage::Comments => f.switch_to_comments(),
-            });
-            return;
-        }
         let status_hit = self
             .feature_form_status_rects
             .iter()
-            .find(|(_, r)| contains(*r, col, row))
-            .map(|(s, _)| *s);
-        if let Some(status) = status_hit {
+            .any(|(_, r)| contains(*r, col, row));
+        if status_hit {
             self.with_feature_form(|f| {
                 f.click_focus(crate::views::feature_form::FormFocus::Status);
-                f.set_status(status);
+                f.cycle_status();
             });
             return;
         }
@@ -1283,7 +1633,12 @@ impl App {
             | AppMode::ConfirmDeleteFeature
             | AppMode::Palette
             | AppMode::ExplorerFilter
-            | AppMode::AiCommit => false,
+            | AppMode::AiCommit
+            | AppMode::AgentRename
+            | AppMode::WorktreePrompt
+            | AppMode::FilePrompt
+            | AppMode::ConfirmDeleteFile
+            | AppMode::Settings => false,
             AppMode::Normal => {
                 if let Some(state) = self.active_state_ref() {
                     if matches!(state.view_mode, ViewMode::Terminal | ViewMode::Agents) {
@@ -1303,6 +1658,12 @@ impl App {
     }
 
     fn on_key_normal(&mut self, key: KeyEvent) -> Result<()> {
+        if self.handle_tab_chord(key) {
+            return Ok(());
+        }
+        if self.handle_context_nav(key)? {
+            return Ok(());
+        }
         let mode = self
             .active_state_ref()
             .map(|s| s.view_mode)
@@ -1312,6 +1673,8 @@ impl App {
             ViewMode::Agents => return self.on_key_agents(key),
             ViewMode::Project => return self.on_key_project_view(key),
             ViewMode::Git => return self.on_key_git_view(key),
+            ViewMode::Github => return self.on_key_github_view(key),
+            ViewMode::Runtime => return self.on_key_runtime_view(key),
             ViewMode::Editor => {}
         }
         if self.handle_global_normal(key)? {
@@ -1329,13 +1692,8 @@ impl App {
     }
 
     fn cycle_view_mode(&mut self, forward: bool) {
-        let order = [
-            ViewMode::Editor,
-            ViewMode::Terminal,
-            ViewMode::Agents,
-            ViewMode::Project,
-            ViewMode::Git,
-        ];
+        self.tab_chord = None;
+        let order = self.view_mode_order();
         if let Some(state) = self.active_state() {
             let cur = order.iter().position(|m| *m == state.view_mode).unwrap_or(0);
             let next = if forward {
@@ -1346,6 +1704,42 @@ impl App {
             state.view_mode = order[next];
         }
         self.after_view_mode_change();
+    }
+
+    pub fn view_mode_order(&mut self) -> Vec<ViewMode> {
+        let project_enabled = self
+            .active_project()
+            .map(|p| self.is_project_view_enabled(p.id))
+            .unwrap_or(true);
+        let mut order = vec![ViewMode::Editor, ViewMode::Terminal, ViewMode::Agents];
+        if project_enabled {
+            order.push(ViewMode::Project);
+        }
+        order.push(ViewMode::Runtime);
+        order.push(ViewMode::Git);
+        if self.github_available_for_active() {
+            order.push(ViewMode::Github);
+        }
+        order
+    }
+
+    pub fn github_available_for_active(&mut self) -> bool {
+        let Some(project) = self.active_project().cloned() else {
+            return false;
+        };
+        if let Some(state) = self.project_views.get(&project.id) {
+            if let Some(view) = &state.github_view {
+                return view.repo_configured;
+            }
+            if let Some(cached) = state.github_available {
+                return cached;
+            }
+        }
+        let available = crate::git::detect_github_url(&project.path).is_some();
+        if let Some(state) = self.project_views.get_mut(&project.id) {
+            state.github_available = Some(available);
+        }
+        available
     }
 
     fn after_view_mode_change(&mut self) {
@@ -1379,7 +1773,170 @@ impl App {
             ViewMode::Git => {
                 self.ensure_git_view_loaded();
             }
+            ViewMode::Github => {
+                self.ensure_github_view_loaded();
+            }
+            ViewMode::Runtime => {
+                self.ensure_runtime_loaded();
+            }
             ViewMode::Editor => {}
+        }
+    }
+
+    pub fn ensure_runtime_loaded(&mut self) {
+        let Some(project) = self.active_project().cloned() else {
+            return;
+        };
+        let already = self
+            .active_state_ref()
+            .map(|s| s.runtime.is_some())
+            .unwrap_or(false);
+        if already {
+            return;
+        }
+        let yaml = self.load_or_bootstrap_runtime_yaml(&project);
+        let runtime = crate::runtime::Runtime::new(project.path.clone(), yaml);
+        if let Some(state) = self.active_state() {
+            state.runtime = Some(runtime);
+        }
+    }
+
+    fn load_or_bootstrap_runtime_yaml(&mut self, project: &Project) -> String {
+        if let Some(cached) = self.runtime_yaml.get(&project.id) {
+            return cached.clone();
+        }
+        let db_yaml = self
+            .db
+            .load_project_runtime_yaml(project.id)
+            .unwrap_or(None);
+        if let Some(yaml) = db_yaml {
+            self.runtime_yaml.insert(project.id, yaml.clone());
+            return yaml;
+        }
+        let file_path = project.path.join(crate::runtime::RUNTIME_CONFIG_FILE);
+        if let Ok(raw) = std::fs::read_to_string(&file_path) {
+            if !raw.trim().is_empty() {
+                if self
+                    .db
+                    .save_project_runtime_yaml(project.id, &raw)
+                    .is_ok()
+                {
+                    self.status = format!(
+                        "Bootstrapped runtime config from {} → DB",
+                        crate::runtime::RUNTIME_CONFIG_FILE
+                    );
+                }
+                self.runtime_yaml.insert(project.id, raw.clone());
+                return raw;
+            }
+        }
+        self.runtime_yaml.insert(project.id, String::new());
+        String::new()
+    }
+
+    pub fn open_runtime_view(&mut self) -> Result<()> {
+        if let Some(state) = self.active_state() {
+            state.view_mode = ViewMode::Runtime;
+        }
+        self.ensure_runtime_loaded();
+        Ok(())
+    }
+
+    fn on_key_runtime_view(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.with_runtime(|r| r.move_selection(1)),
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.with_runtime(|r| r.move_selection(-1)),
+            (KeyCode::Char('g'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                self.with_runtime(|r| r.select_index(0));
+            }
+            (KeyCode::Char('G'), _) => {
+                self.with_runtime(|r| {
+                    let n = r.services.len();
+                    if n > 0 {
+                        r.select_index(n - 1);
+                    }
+                });
+            }
+            (KeyCode::Enter, _) | (KeyCode::Char('f'), _) => {
+                self.with_runtime(|r| r.toggle_filter_selected());
+            }
+            (KeyCode::Esc, _) => self.with_runtime(|r| r.clear_filter()),
+            (KeyCode::Char('c'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                self.with_runtime(|r| r.clear_log());
+            }
+            (KeyCode::Char('e'), _) => {
+                self.reapply_runtime_yaml_from_cache();
+                self.status = self.runtime_load_status();
+            }
+            (KeyCode::Char('r'), _) => self.runtime_action(RuntimeAction::Run, true),
+            (KeyCode::Char('R'), _) => self.runtime_action(RuntimeAction::Run, false),
+            (KeyCode::Char('s'), _) => self.runtime_action(RuntimeAction::Stop, true),
+            (KeyCode::Char('S'), _) => self.runtime_action(RuntimeAction::Stop, false),
+            (KeyCode::Char('b'), _) => self.runtime_action(RuntimeAction::Build, true),
+            (KeyCode::Char('B'), _) => self.runtime_action(RuntimeAction::Build, false),
+            (KeyCode::Char('x'), _) => self.runtime_action(RuntimeAction::Restart, true),
+            (KeyCode::Char('X'), _) => self.runtime_action(RuntimeAction::Restart, false),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn runtime_action(&mut self, action: RuntimeAction, selected_only: bool) {
+        let target = if selected_only {
+            self.active_state()
+                .and_then(|s| s.runtime.as_ref())
+                .and_then(|r| r.selected_service_name())
+        } else {
+            None
+        };
+        let Some(runtime) = self.active_state().and_then(|s| s.runtime.as_mut()) else {
+            return;
+        };
+        let target_ref = target.as_deref();
+        match action {
+            RuntimeAction::Run => runtime.run(target_ref),
+            RuntimeAction::Stop => runtime.stop(target_ref),
+            RuntimeAction::Build => runtime.build(target_ref),
+            RuntimeAction::Restart => runtime.reload(target_ref),
+        }
+    }
+
+    fn with_runtime(&mut self, mut f: impl FnMut(&mut crate::runtime::Runtime)) {
+        if let Some(runtime) = self.active_state().and_then(|s| s.runtime.as_mut()) {
+            f(runtime);
+        }
+    }
+
+    fn runtime_load_status(&self) -> String {
+        let Some(runtime) = self
+            .active_state_ref()
+            .and_then(|s| s.runtime.as_ref())
+        else {
+            return "Runtime not loaded".into();
+        };
+        if let Some(err) = &runtime.last_load_error {
+            return format!("Runtime config error: {}", first_line(err));
+        }
+        format!("Runtime config reloaded ({} services)", runtime.services.len())
+    }
+
+    fn palette_runtime_action(&mut self, action: RuntimeAction, arg: &str) {
+        let in_runtime = matches!(self.current_view_mode(), Some(ViewMode::Runtime));
+        if !in_runtime {
+            let _ = self.open_runtime_view();
+        }
+        let target = arg.trim();
+        let target_opt = if target.is_empty() { None } else { Some(target.to_string()) };
+        let Some(runtime) = self.active_state().and_then(|s| s.runtime.as_mut()) else {
+            self.status = "Runtime view unavailable".into();
+            return;
+        };
+        let target_ref = target_opt.as_deref();
+        match action {
+            RuntimeAction::Run => runtime.run(target_ref),
+            RuntimeAction::Stop => runtime.stop(target_ref),
+            RuntimeAction::Build => runtime.build(target_ref),
+            RuntimeAction::Restart => runtime.reload(target_ref),
         }
     }
 
@@ -1397,6 +1954,23 @@ impl App {
         let view = crate::views::git::GitTreeView::new(project.path.clone());
         if let Some(state) = self.active_state() {
             state.git_view = Some(view);
+        }
+    }
+
+    pub fn ensure_github_view_loaded(&mut self) {
+        let Some(project) = self.active_project().cloned() else {
+            return;
+        };
+        let already = self
+            .active_state_ref()
+            .map(|s| s.github_view.is_some())
+            .unwrap_or(false);
+        if already {
+            return;
+        }
+        let view = crate::views::github::GithubView::new(project.path.clone());
+        if let Some(state) = self.active_state() {
+            state.github_view = Some(view);
         }
     }
 
@@ -1419,17 +1993,250 @@ impl App {
         }
     }
 
-    fn handle_global_normal(&mut self, key: KeyEvent) -> Result<bool> {
+    fn handle_global_normal(&mut self, _key: KeyEvent) -> Result<bool> {
+        Ok(false)
+    }
+
+    pub fn has_subtabs(&self) -> bool {
+        matches!(
+            self.current_view_mode(),
+            Some(ViewMode::Terminal | ViewMode::Agents)
+        )
+    }
+
+    fn context_cycle(&self, forward: bool) -> FocusContext {
+        let mut order: Vec<FocusContext> = vec![FocusContext::ProjectTabs, FocusContext::ViewTabs];
+        if self.has_subtabs() {
+            order.push(FocusContext::SubTabs);
+        }
+        order.push(FocusContext::Body);
+        let cur = order
+            .iter()
+            .position(|c| *c == self.focus_context)
+            .unwrap_or(order.len() - 1);
+        let next = if forward {
+            (cur + 1) % order.len()
+        } else {
+            (cur + order.len() - 1) % order.len()
+        };
+        order[next]
+    }
+
+    fn enter_focus_context(&mut self, ctx: FocusContext) {
+        self.focus_context = ctx;
+        if matches!(ctx, FocusContext::SubTabs) {
+            let mode = self.current_view_mode();
+            if matches!(mode, Some(ViewMode::Terminal)) {
+                let need = self
+                    .active_state_ref()
+                    .map(|s| s.terminals.is_empty())
+                    .unwrap_or(false);
+                if need {
+                    let _ = self.new_terminal();
+                }
+            } else if matches!(mode, Some(ViewMode::Agents)) {
+                let _ = self.ensure_agents_restored();
+                let need = self
+                    .active_state_ref()
+                    .map(|s| s.agents.is_empty())
+                    .unwrap_or(false);
+                if need {
+                    let _ = self.new_agent();
+                }
+            }
+        }
+    }
+
+    fn handle_tab_chord(&mut self, key: KeyEvent) -> bool {
+        self.expire_tab_chord();
+        let is_plain_tab = matches!(key.code, KeyCode::Tab)
+            && !key.modifiers.intersects(
+                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+            );
+        if !is_plain_tab {
+            self.tab_chord = None;
+            return false;
+        }
+        if !self.tab_chord_eligible() {
+            self.tab_chord = None;
+            return false;
+        }
+        if self.tab_chord.take().is_some() {
+            self.toggle_nav_mode();
+            return true;
+        }
+        self.tab_chord = Some(Instant::now());
+        match self.current_view_mode() {
+            Some(ViewMode::Terminal) => self.write_to_active_terminal(&[b'\t']),
+            Some(ViewMode::Agents) => self.write_to_active_agent(&[b'\t']),
+            _ => {}
+        }
+        true
+    }
+
+    fn expire_tab_chord(&mut self) {
+        if let Some(t0) = self.tab_chord {
+            if t0.elapsed() >= std::time::Duration::from_millis(400) {
+                self.tab_chord = None;
+            }
+        }
+    }
+
+    fn tab_chord_eligible(&self) -> bool {
+        if !matches!(self.mode, AppMode::Normal) {
+            return false;
+        }
+        let view = self.current_view_mode().unwrap_or(ViewMode::Editor);
+        if matches!(view, ViewMode::Terminal | ViewMode::Agents) {
+            return !self.terminal_prefix;
+        }
+        if matches!(view, ViewMode::Editor) {
+            let editing = self
+                .active_state_ref()
+                .and_then(|s| s.editor.as_ref())
+                .map(|e| matches!(e.mode, EditorMode::Insert | EditorMode::Search))
+                .unwrap_or(false);
+            return !editing;
+        }
+        if matches!(view, ViewMode::Project) {
+            let in_form = self
+                .active_state_ref()
+                .and_then(|s| s.project_view.as_ref())
+                .map(|m| m.editor.is_some() || m.feature_form.is_some())
+                .unwrap_or(false);
+            return !in_form;
+        }
+        true
+    }
+
+    fn toggle_nav_mode(&mut self) {
+        if matches!(self.focus_context, FocusContext::Body) {
+            self.enter_focus_context(FocusContext::ViewTabs);
+            self.status = "Nav mode — arrows to navigate, Esc to exit".into();
+        } else {
+            self.focus_context = FocusContext::Body;
+            self.status = "Nav mode off".into();
+        }
+    }
+
+    fn handle_context_nav(&mut self, key: KeyEvent) -> Result<bool> {
+        let view = self.current_view_mode().unwrap_or(ViewMode::Editor);
+        let body_in_pty = matches!(view, ViewMode::Terminal | ViewMode::Agents);
+        let in_editor_typing = if matches!(view, ViewMode::Editor) {
+            self.active_state_ref()
+                .and_then(|s| s.editor.as_ref())
+                .map(|e| matches!(e.mode, EditorMode::Insert | EditorMode::Search))
+                .unwrap_or(false)
+        } else if matches!(view, ViewMode::Project) {
+            self.active_state_ref()
+                .and_then(|s| s.project_view.as_ref())
+                .map(|m| m.editor.is_some() || m.feature_form.is_some())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        let _ = (body_in_pty, in_editor_typing);
+        if matches!(self.focus_context, FocusContext::Body) {
+            return Ok(false);
+        }
+
+        let dir = Self::nav_direction(key);
         match (key.code, key.modifiers) {
-            (KeyCode::Tab, _) => {
-                self.next_project();
+            (KeyCode::Esc, _) => {
+                self.focus_context = FocusContext::Body;
                 Ok(true)
             }
-            (KeyCode::BackTab, _) => {
-                self.prev_project();
+            (KeyCode::Enter, _) => {
+                self.context_activate();
+                self.focus_context = FocusContext::Body;
                 Ok(true)
             }
-            _ => Ok(false),
+            _ => {
+                if let Some(d) = dir {
+                    match d {
+                        NavDir::Left => self.context_nav_horizontal(false),
+                        NavDir::Right => self.context_nav_horizontal(true),
+                        NavDir::Up => self.context_nav_vertical(false),
+                        NavDir::Down => self.context_nav_vertical(true),
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    fn nav_direction(key: KeyEvent) -> Option<NavDir> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Left => Some(NavDir::Left),
+            KeyCode::Right => Some(NavDir::Right),
+            KeyCode::Up => Some(NavDir::Up),
+            KeyCode::Down => Some(NavDir::Down),
+            KeyCode::Char('h') if ctrl => Some(NavDir::Left),
+            KeyCode::Char('l') if ctrl => Some(NavDir::Right),
+            KeyCode::Char('k') if ctrl => Some(NavDir::Up),
+            KeyCode::Char('j') if ctrl => Some(NavDir::Down),
+            _ => None,
+        }
+    }
+
+    fn context_nav_horizontal(&mut self, forward: bool) {
+        match self.focus_context {
+            FocusContext::ProjectTabs => {
+                if forward {
+                    self.next_project();
+                } else {
+                    self.prev_project();
+                }
+            }
+            FocusContext::ViewTabs => {
+                self.cycle_view_mode(forward);
+            }
+            FocusContext::SubTabs => match self.current_view_mode() {
+                Some(ViewMode::Terminal) => self.cycle_terminal(forward),
+                Some(ViewMode::Agents) => self.cycle_agent(forward),
+                _ => {}
+            },
+            FocusContext::Body => {}
+        }
+    }
+
+    fn context_nav_vertical(&mut self, forward: bool) {
+        if matches!(self.focus_context, FocusContext::Body) {
+            return;
+        }
+        if forward {
+            let next = self.context_cycle(true);
+            self.enter_focus_context(next);
+        } else {
+            let next = self.context_cycle(false);
+            self.enter_focus_context(next);
+        }
+    }
+
+    fn context_activate(&mut self) {
+        let mode = self.current_view_mode();
+        if matches!(self.focus_context, FocusContext::ViewTabs) {
+            if matches!(mode, Some(ViewMode::Terminal)) {
+                let need = self
+                    .active_state_ref()
+                    .map(|s| s.terminals.is_empty())
+                    .unwrap_or(false);
+                if need {
+                    let _ = self.new_terminal();
+                }
+            }
+            if matches!(mode, Some(ViewMode::Agents)) {
+                let _ = self.ensure_agents_restored();
+                let need = self
+                    .active_state_ref()
+                    .map(|s| s.agents.is_empty())
+                    .unwrap_or(false);
+                if need {
+                    let _ = self.new_agent();
+                }
+            }
         }
     }
 
@@ -1502,6 +2309,36 @@ impl App {
                     self.toggle_stage_all()?;
                 }
             }
+            (KeyCode::Char('a'), _) => {
+                if matches!(pane, LeftPaneMode::Tree) {
+                    self.start_new_file();
+                }
+            }
+            (KeyCode::Char('A'), _) => {
+                if matches!(pane, LeftPaneMode::Tree) {
+                    self.start_new_dir();
+                }
+            }
+            (KeyCode::Char('r'), _) => {
+                if matches!(pane, LeftPaneMode::Tree) {
+                    self.start_rename_file();
+                }
+            }
+            (KeyCode::Char('d'), _) => {
+                if matches!(pane, LeftPaneMode::Tree) {
+                    self.start_delete_file();
+                }
+            }
+            (KeyCode::Char('c'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                if matches!(pane, LeftPaneMode::Tree) {
+                    self.yank_selected_file();
+                }
+            }
+            (KeyCode::Char('p'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                if matches!(pane, LeftPaneMode::Tree) {
+                    self.paste_yanked_file();
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -1546,12 +2383,53 @@ impl App {
     pub fn tick(&mut self) {
         self.poll_ai_commit();
         self.poll_agent_lane();
+        self.poll_disk_changes();
+        self.poll_runtimes();
+        self.sanitize_view_mode();
+    }
+
+    fn sanitize_view_mode(&mut self) {
+        let Some(project_id) = self.active_project().map(|p| p.id) else { return };
+        let valid = self.view_mode_order();
+        if let Some(state) = self.project_views.get_mut(&project_id) {
+            if !valid.contains(&state.view_mode) {
+                state.view_mode = valid.first().copied().unwrap_or(ViewMode::Editor);
+            }
+        }
+    }
+
+    fn poll_runtimes(&mut self) {
+        for state in self.project_views.values_mut() {
+            if let Some(runtime) = state.runtime.as_mut() {
+                runtime.tick();
+            }
+        }
+    }
+
+    fn poll_disk_changes(&mut self) {
+        let now = Instant::now();
+        let due = self
+            .last_disk_poll
+            .map(|t| now.duration_since(t).as_millis() >= 1000)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_disk_poll = Some(now);
+        for state in self.project_views.values_mut() {
+            if let Some(editor) = state.editor.as_mut() {
+                editor.poll_disk();
+            }
+            state.tree.refresh();
+        }
+        let _ = self.refresh_git_status();
     }
 
     fn poll_agent_lane(&mut self) {
         for state in self.project_views.values_mut() {
             for agent in state.agents.iter_mut() {
                 agent.poll_status();
+                agent.try_flush_initial_input();
             }
         }
         if matches!(self.current_view_mode(), Some(ViewMode::Agents)) {
@@ -1563,6 +2441,113 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn start_rename_active_agent(&mut self) {
+        let pid = match self.active_project().map(|p| p.id) {
+            Some(id) => id,
+            None => {
+                self.status = "No active project".into();
+                return;
+            }
+        };
+        let (idx, current_name) = match self
+            .project_views
+            .get(&pid)
+            .and_then(|s| s.active_agent.and_then(|i| s.agents.get(i).map(|a| (i, a.name.clone()))))
+        {
+            Some(v) => v,
+            None => {
+                self.status = "No active agent to rename".into();
+                return;
+            }
+        };
+        let cursor = current_name.chars().count();
+        self.agent_rename = Some(AgentRenameState {
+            project_id: pid,
+            agent_idx: idx,
+            buffer: current_name,
+            cursor,
+        });
+        self.mode = AppMode::AgentRename;
+    }
+
+    fn cancel_agent_rename(&mut self) {
+        self.agent_rename = None;
+        self.mode = AppMode::Normal;
+    }
+
+    fn commit_agent_rename(&mut self) {
+        let Some(st) = self.agent_rename.take() else {
+            self.mode = AppMode::Normal;
+            return;
+        };
+        self.mode = AppMode::Normal;
+        let new_name = st.buffer.trim().to_string();
+        if new_name.is_empty() {
+            self.status = "Rename cancelled (empty name)".into();
+            return;
+        }
+        if let Some(state) = self.project_views.get_mut(&st.project_id) {
+            if let Some(agent) = state.agents.get_mut(st.agent_idx) {
+                agent.name = new_name;
+            }
+        }
+    }
+
+    fn on_key_agent_rename(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(st) = self.agent_rename.as_mut() else {
+            self.mode = AppMode::Normal;
+            return Ok(());
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.cancel_agent_rename(),
+            (KeyCode::Enter, _) => self.commit_agent_rename(),
+            (KeyCode::Backspace, _) => {
+                if st.cursor > 0 {
+                    let chars: Vec<char> = st.buffer.chars().collect();
+                    let new_chars: Vec<char> = chars
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| if i + 1 == st.cursor { None } else { Some(*c) })
+                        .collect();
+                    st.buffer = new_chars.iter().collect();
+                    st.cursor -= 1;
+                }
+            }
+            (KeyCode::Delete, _) => {
+                let chars: Vec<char> = st.buffer.chars().collect();
+                if st.cursor < chars.len() {
+                    let new_chars: Vec<char> = chars
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| if i == st.cursor { None } else { Some(*c) })
+                        .collect();
+                    st.buffer = new_chars.iter().collect();
+                }
+            }
+            (KeyCode::Left, _) => {
+                if st.cursor > 0 {
+                    st.cursor -= 1;
+                }
+            }
+            (KeyCode::Right, _) => {
+                let len = st.buffer.chars().count();
+                if st.cursor < len {
+                    st.cursor += 1;
+                }
+            }
+            (KeyCode::Home, _) => st.cursor = 0,
+            (KeyCode::End, _) => st.cursor = st.buffer.chars().count(),
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) => {
+                let mut chars: Vec<char> = st.buffer.chars().collect();
+                chars.insert(st.cursor, c);
+                st.buffer = chars.iter().collect();
+                st.cursor += 1;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn toggle_agent_lane(&mut self) {
@@ -1597,7 +2582,8 @@ impl App {
             return Ok(());
         };
         let staged = git::staged_diff(&project.path).unwrap_or_default();
-        let provider = match crate::ai::build_provider(&self.ai_config) {
+        let ai_config = self.effective_ai_config(project.id);
+        let provider = match crate::ai::build_provider(&ai_config) {
             Ok(p) => p,
             Err(e) => {
                 self.status = format!("AI provider error: {}", e);
@@ -1891,8 +2877,329 @@ impl App {
     }
 
     fn open_settings_in_editor(&mut self) -> Result<()> {
-        let path = self.settings_path.clone();
-        self.open_file_in_editor(path)
+        self.open_settings_overlay()
+    }
+
+    fn open_settings_overlay(&mut self) -> Result<()> {
+        let global_content = std::fs::read_to_string(&self.settings_path).unwrap_or_default();
+        let mut global = EditorView::from_content(self.settings_path.clone(), global_content)?;
+        global.focused = true;
+
+        let (project_id, project_path) = match self.active_project() {
+            Some(p) => (Some(p.id), Some(p.path.clone())),
+            None => (None, None),
+        };
+        let project_yaml = project_id
+            .and_then(|id| self.project_settings_yaml.get(&id).cloned())
+            .unwrap_or_default();
+        let initial = if project_yaml.trim().is_empty() {
+            ProjectSettings::empty_template()
+        } else {
+            project_yaml
+        };
+        let virtual_path = project_path
+            .clone()
+            .map(|p| p.join(config::PROJECT_SETTINGS_FILE))
+            .unwrap_or_else(|| PathBuf::from(config::PROJECT_SETTINGS_FILE));
+        let mut project = EditorView::from_content(virtual_path, initial)?;
+        project.focused = false;
+
+        self.settings_overlay = Some(SettingsOverlay {
+            global,
+            project,
+            focus: SettingsPane::Global,
+            project_id,
+            project_path,
+            status: String::new(),
+        });
+        self.mode = AppMode::Settings;
+        Ok(())
+    }
+
+    fn close_settings_overlay(&mut self) {
+        self.settings_overlay = None;
+        self.mode = AppMode::Normal;
+    }
+
+    fn on_key_settings(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                let modified = self
+                    .settings_overlay
+                    .as_ref()
+                    .map(|o| o.global.modified || o.project.modified)
+                    .unwrap_or(false);
+                if modified {
+                    if let Some(overlay) = self.settings_overlay.as_mut() {
+                        overlay.status =
+                            "Unsaved changes — press Esc again to discard".into();
+                        overlay.global.modified = false;
+                        overlay.project.modified = false;
+                    }
+                } else {
+                    self.close_settings_overlay();
+                }
+            }
+            (KeyCode::Tab, m) | (KeyCode::BackTab, m)
+                if !m.contains(KeyModifiers::CONTROL) =>
+            {
+                if let Some(overlay) = self.settings_overlay.as_mut() {
+                    overlay.focus = match overlay.focus {
+                        SettingsPane::Global => SettingsPane::Project,
+                        SettingsPane::Project => SettingsPane::Global,
+                    };
+                    overlay.global.focused = matches!(overlay.focus, SettingsPane::Global);
+                    overlay.project.focused = matches!(overlay.focus, SettingsPane::Project);
+                    overlay.status.clear();
+                }
+            }
+            (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.save_settings_focused()?;
+            }
+            (KeyCode::Char('i'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.import_project_settings_from_file();
+            }
+            (KeyCode::Char('e'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.export_project_settings_to_file();
+            }
+            _ => {
+                if let Some(overlay) = self.settings_overlay.as_mut() {
+                    match overlay.focus {
+                        SettingsPane::Global => overlay.global.handle_key(key),
+                        SettingsPane::Project => overlay.project.handle_key(key),
+                    }
+                    overlay.status.clear();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn save_settings_focused(&mut self) -> Result<()> {
+        let Some(overlay) = self.settings_overlay.as_mut() else {
+            return Ok(());
+        };
+        match overlay.focus {
+            SettingsPane::Global => {
+                if let Err(e) = overlay.global.save() {
+                    overlay.status = format!("Save error: {}", e);
+                    return Ok(());
+                }
+                overlay.status = "Global settings saved".into();
+                self.reload_settings_from_disk();
+            }
+            SettingsPane::Project => {
+                let Some(project_id) = overlay.project_id else {
+                    overlay.status = "No active project".into();
+                    return Ok(());
+                };
+                let body: String = overlay
+                    .project
+                    .lines
+                    .iter()
+                    .map(|l| l.iter().collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if let Err(e) = ProjectSettings::from_yaml(&body) {
+                    overlay.status = format!("Invalid YAML: {}", e);
+                    return Ok(());
+                }
+                if let Err(e) = self.db.save_project_settings_yaml(project_id, &body) {
+                    if let Some(o) = self.settings_overlay.as_mut() {
+                        o.status = format!("DB error: {}", e);
+                    }
+                    return Ok(());
+                }
+                self.project_settings_yaml.insert(project_id, body);
+                if let Some(o) = self.settings_overlay.as_mut() {
+                    o.project.modified = false;
+                    o.status = "Project settings saved to DB".into();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn import_project_settings_from_file(&mut self) {
+        let Some(overlay) = self.settings_overlay.as_mut() else { return };
+        let Some(project_path) = overlay.project_path.clone() else {
+            overlay.status = "No active project".into();
+            return;
+        };
+        let Some(project_id) = overlay.project_id else {
+            overlay.status = "No active project".into();
+            return;
+        };
+        let path = project_path.join(config::PROJECT_SETTINGS_FILE);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                overlay.status = format!("Read {}: {}", path.display(), e);
+                return;
+            }
+        };
+        if let Err(e) = ProjectSettings::from_yaml(&raw) {
+            overlay.status = format!("Invalid YAML in {}: {}", path.display(), e);
+            return;
+        }
+        if let Err(e) = self.db.save_project_settings_yaml(project_id, &raw) {
+            if let Some(o) = self.settings_overlay.as_mut() {
+                o.status = format!("DB error: {}", e);
+            }
+            return;
+        }
+        self.project_settings_yaml.insert(project_id, raw.clone());
+        if let Some(o) = self.settings_overlay.as_mut() {
+            match EditorView::from_content(o.project.path.clone(), raw) {
+                Ok(mut view) => {
+                    view.focused = matches!(o.focus, SettingsPane::Project);
+                    o.project = view;
+                }
+                Err(e) => {
+                    o.status = format!("Reload error: {}", e);
+                    return;
+                }
+            }
+            o.status = format!("Imported {} → DB", config::PROJECT_SETTINGS_FILE);
+        }
+    }
+
+    fn palette_import_project_settings(&mut self) {
+        let Some(project) = self.active_project().cloned() else {
+            self.status = "No active project".into();
+            return;
+        };
+        let path = project.path.join(config::PROJECT_SETTINGS_FILE);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Read {}: {}", path.display(), e);
+                return;
+            }
+        };
+        if let Err(e) = ProjectSettings::from_yaml(&raw) {
+            self.status = format!("Invalid YAML in {}: {}", path.display(), e);
+            return;
+        }
+        if let Err(e) = self.db.save_project_settings_yaml(project.id, &raw) {
+            self.status = format!("DB error: {}", e);
+            return;
+        }
+        self.project_settings_yaml.insert(project.id, raw);
+        self.status = format!("Imported {} → DB", path.display());
+    }
+
+    fn palette_export_project_settings(&mut self) {
+        let Some(project) = self.active_project().cloned() else {
+            self.status = "No active project".into();
+            return;
+        };
+        let body = self
+            .project_settings_yaml
+            .get(&project.id)
+            .cloned()
+            .unwrap_or_default();
+        if body.trim().is_empty() {
+            self.status = "Project settings empty — nothing to export".into();
+            return;
+        }
+        if let Err(e) = ProjectSettings::from_yaml(&body) {
+            self.status = format!("Invalid project settings in DB: {}", e);
+            return;
+        }
+        let path = project.path.join(config::PROJECT_SETTINGS_FILE);
+        if let Err(e) = std::fs::write(&path, &body) {
+            self.status = format!("Write {}: {}", path.display(), e);
+            return;
+        }
+        self.status = format!("Exported DB → {}", path.display());
+    }
+
+    fn palette_import_runtime(&mut self) {
+        let Some(project) = self.active_project().cloned() else {
+            self.status = "No active project".into();
+            return;
+        };
+        let path = project.path.join(crate::runtime::RUNTIME_CONFIG_FILE);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Read {}: {}", path.display(), e);
+                return;
+            }
+        };
+        if let Err(e) = crate::runtime::parse_runtime_yaml(&raw) {
+            self.status = format!("Invalid YAML in {}: {}", path.display(), e);
+            return;
+        }
+        if let Err(e) = self.db.save_project_runtime_yaml(project.id, &raw) {
+            self.status = format!("DB error: {}", e);
+            return;
+        }
+        self.runtime_yaml.insert(project.id, raw.clone());
+        self.reapply_runtime_yaml_from_cache();
+        self.status = format!("Imported {} → DB", path.display());
+    }
+
+    fn palette_export_runtime(&mut self) {
+        let Some(project) = self.active_project().cloned() else {
+            self.status = "No active project".into();
+            return;
+        };
+        let body = self
+            .runtime_yaml
+            .get(&project.id)
+            .cloned()
+            .unwrap_or_default();
+        if body.trim().is_empty() {
+            self.status = "Runtime config empty — nothing to export".into();
+            return;
+        }
+        let path = project.path.join(crate::runtime::RUNTIME_CONFIG_FILE);
+        if let Err(e) = std::fs::write(&path, &body) {
+            self.status = format!("Write {}: {}", path.display(), e);
+            return;
+        }
+        self.status = format!("Exported DB → {}", path.display());
+    }
+
+    fn reapply_runtime_yaml_from_cache(&mut self) {
+        let Some(project_id) = self.active_project().map(|p| p.id) else { return };
+        let yaml = self
+            .runtime_yaml
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(state) = self.active_state() {
+            if let Some(rt) = state.runtime.as_mut() {
+                rt.apply_yaml(yaml);
+            }
+        }
+    }
+
+    fn export_project_settings_to_file(&mut self) {
+        let Some(overlay) = self.settings_overlay.as_mut() else { return };
+        let Some(project_path) = overlay.project_path.clone() else {
+            overlay.status = "No active project".into();
+            return;
+        };
+        let body: String = overlay
+            .project
+            .lines
+            .iter()
+            .map(|l| l.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Err(e) = ProjectSettings::from_yaml(&body) {
+            overlay.status = format!("Invalid YAML: {}", e);
+            return;
+        }
+        let path = project_path.join(config::PROJECT_SETTINGS_FILE);
+        if let Err(e) = std::fs::write(&path, &body) {
+            overlay.status = format!("Write {}: {}", path.display(), e);
+            return;
+        }
+        overlay.status = format!("Exported DB → {}", path.display());
     }
 
     fn reload_settings_from_disk(&mut self) {
@@ -1900,12 +3207,59 @@ impl App {
             Ok(s) => {
                 self.roots = s.roots;
                 self.search_excludes = s.search_excludes;
+                self.ai_config = s.ai;
+                self.shell_config = s.shell;
                 self.status = "Settings reloaded".into();
             }
             Err(e) => {
                 self.status = format!("Settings reload failed: {}", e);
             }
         }
+    }
+
+    fn global_settings_snapshot(&self) -> Settings {
+        Settings {
+            roots: self.roots.clone(),
+            search_excludes: self.search_excludes.clone(),
+            ai: self.ai_config.clone(),
+            shell: self.shell_config.clone(),
+        }
+    }
+
+    pub fn effective_settings_for(&self, project_id: i64) -> Settings {
+        let global = self.global_settings_snapshot();
+        let Some(raw) = self.project_settings_yaml.get(&project_id) else {
+            return global;
+        };
+        match ProjectSettings::from_yaml(raw) {
+            Ok(overrides) => global.with_project_overrides(&overrides),
+            Err(_) => global,
+        }
+    }
+
+    pub fn effective_ai_config(&self, project_id: i64) -> crate::config::AiConfig {
+        self.effective_settings_for(project_id).ai
+    }
+
+    pub fn effective_shell_config(&self, project_id: i64) -> crate::config::ShellConfig {
+        self.effective_settings_for(project_id).shell
+    }
+
+    pub fn effective_search_excludes(&self, project_id: i64) -> Vec<String> {
+        self.effective_settings_for(project_id).search_excludes
+    }
+
+    pub fn is_project_view_enabled(&self, project_id: i64) -> bool {
+        let Some(raw) = self.project_settings_yaml.get(&project_id) else {
+            return true;
+        };
+        let Ok(overrides) = ProjectSettings::from_yaml(raw) else {
+            return true;
+        };
+        overrides
+            .views
+            .and_then(|v| v.project)
+            .unwrap_or(true)
     }
 
     fn open_file_in_editor(&mut self, path: PathBuf) -> Result<()> {
@@ -2192,6 +3546,26 @@ impl App {
         self.open_project(project)
     }
 
+    pub fn open_worktree_path(&mut self, path: &Path) -> Result<()> {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Some(i) = self
+            .open_projects
+            .iter()
+            .position(|p| paths_equal(&p.path, &canon))
+        {
+            self.active_index = i;
+            self.persist_open_projects()?;
+            self.status = format!("Switched to worktree {}", canon.display());
+            return Ok(());
+        }
+        let name = canon
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("worktree")
+            .to_string();
+        self.add_and_open_project(name, canon)
+    }
+
     fn rebuild_picker_data(&mut self) -> Result<()> {
         let saved = self.db.list_projects()?;
         let discovered = discover_new(&self.roots, &saved);
@@ -2301,6 +3675,12 @@ impl App {
             tree.set_git_status(status.clone());
             let mut changes = ChangesView::new(project.path.clone());
             changes.set_status(&status);
+            let yaml = self
+                .db
+                .load_project_settings_yaml(project.id)?
+                .unwrap_or_default();
+            self.project_settings_yaml.insert(project.id, yaml);
+            let branch = git::current_branch(&project.path);
             self.project_views.insert(
                 project.id,
                 ProjectViewState {
@@ -2318,6 +3698,10 @@ impl App {
                     view_mode: ViewMode::Editor,
                     project_view: None,
                     git_view: None,
+                    github_view: None,
+                    github_available: None,
+                    runtime: None,
+                    branch,
                 },
             );
             self.open_projects.push(project);
@@ -2353,8 +3737,20 @@ impl App {
         Ok(())
     }
 
+    fn open_github_view(&mut self) -> Result<()> {
+        if !self.github_available_for_active() {
+            self.status = "GitHub view unavailable — no `origin` remote on github.com".into();
+            return Ok(());
+        }
+        if let Some(state) = self.active_state() {
+            state.view_mode = ViewMode::Github;
+        }
+        self.ensure_github_view_loaded();
+        Ok(())
+    }
+
     fn on_key_git_view(&mut self, key: KeyEvent) -> Result<()> {
-        use crate::views::git::DetailsMode;
+        use crate::views::git::{DetailsMode, GitPane};
         match (key.code, key.modifiers) {
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.with_git_view(|v| v.move_down()),
             (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.with_git_view(|v| v.move_up()),
@@ -2362,19 +3758,35 @@ impl App {
                 self.with_git_view(|v| v.jump_top());
             }
             (KeyCode::Char('G'), _) => self.with_git_view(|v| v.jump_bottom()),
-            (KeyCode::Tab, _) => self.with_git_view(|v| v.cycle_pane(true)),
-            (KeyCode::BackTab, _) => self.with_git_view(|v| v.cycle_pane(false)),
+            (KeyCode::Char('l'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.with_git_view(|v| v.cycle_pane(true));
+            }
+            (KeyCode::Char('h'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.with_git_view(|v| v.cycle_pane(false));
+            }
             (KeyCode::Enter, _) | (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
-                self.with_git_view(|v| v.activate());
+                let on_worktree = self
+                    .active_state_ref()
+                    .and_then(|s| s.git_view.as_ref())
+                    .map(|v| {
+                        v.focus == GitPane::Details
+                            && matches!(v.details_mode, DetailsMode::Worktrees)
+                    })
+                    .unwrap_or(false);
+                if on_worktree {
+                    self.git_view_open_selected_worktree()?;
+                } else {
+                    self.with_git_view(|v| v.activate());
+                }
             }
             (KeyCode::Esc, _) | (KeyCode::Backspace, _) | (KeyCode::Char('h'), _)
             | (KeyCode::Left, _) => {
-                let in_pr = self
+                let in_overlay = self
                     .active_state_ref()
                     .and_then(|s| s.git_view.as_ref())
                     .map(|v| !matches!(v.details_mode, DetailsMode::Commit))
                     .unwrap_or(false);
-                if in_pr {
+                if in_overlay {
                     self.with_git_view(|v| v.back_to_pr_list());
                 }
             }
@@ -2388,6 +3800,9 @@ impl App {
             (KeyCode::Char('m'), _) => self.git_view_merge(),
             (KeyCode::Char('R'), _) => self.git_view_create_pr(),
             (KeyCode::Char('V'), _) => self.git_view_load_prs(),
+            (KeyCode::Char('W'), _) => self.git_view_load_worktrees(),
+            (KeyCode::Char('n'), _) => self.git_view_start_new_worktree(),
+            (KeyCode::Char('D'), _) => self.git_view_remove_worktree(),
             _ => {}
         }
         Ok(())
@@ -2483,6 +3898,547 @@ impl App {
         }
     }
 
+    fn git_view_load_worktrees(&mut self) {
+        let count = self
+            .active_state()
+            .and_then(|s| s.git_view.as_mut())
+            .map(|v| {
+                v.load_worktrees();
+                v.worktrees.len()
+            });
+        if let Some(n) = count {
+            self.status = format!("Loaded {} worktrees", n);
+        }
+    }
+
+    fn git_view_open_selected_worktree(&mut self) -> Result<()> {
+        let path = self
+            .active_state()
+            .and_then(|s| s.git_view.as_ref())
+            .and_then(|v| v.selected_worktree().map(|w| w.path.clone()));
+        let Some(path) = path else {
+            self.status = "No worktree selected".into();
+            return Ok(());
+        };
+        self.open_worktree_path(&path)?;
+        Ok(())
+    }
+
+    fn git_view_remove_worktree(&mut self) {
+        let result = self
+            .active_state()
+            .and_then(|s| s.git_view.as_mut())
+            .map(|v| v.remove_selected_worktree(false));
+        match result {
+            Some(Ok(out)) => self.status = git_first_line(&out, "Worktree removed"),
+            Some(Err(e)) => {
+                let needs_force = e.contains("contains modified")
+                    || e.contains("not clean")
+                    || e.contains("locked")
+                    || e.contains("use --force");
+                if needs_force {
+                    let forced = self
+                        .active_state()
+                        .and_then(|s| s.git_view.as_mut())
+                        .map(|v| v.remove_selected_worktree(true));
+                    match forced {
+                        Some(Ok(out)) => self.status = format!("force-removed: {}", git_first_line(&out, "ok")),
+                        Some(Err(e2)) => self.status = format!("remove failed: {}", git_first_line(&e2, "")),
+                        None => {}
+                    }
+                } else {
+                    self.status = format!("remove failed: {}", git_first_line(&e, ""));
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn on_key_github_view(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.with_github_view(|v| v.move_down()),
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.with_github_view(|v| v.move_up()),
+            (KeyCode::Char('g'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                self.with_github_view(|v| v.jump_top());
+            }
+            (KeyCode::Char('G'), _) => self.with_github_view(|v| v.jump_bottom()),
+            (KeyCode::Char('l'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.with_github_view(|v| v.cycle_pane(true));
+            }
+            (KeyCode::Char('h'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.with_github_view(|v| v.cycle_pane(false));
+            }
+            (KeyCode::Enter, _) | (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
+                self.with_github_view(|v| v.activate());
+            }
+            (KeyCode::Esc, _) | (KeyCode::Backspace, _) | (KeyCode::Char('h'), _)
+            | (KeyCode::Left, _) => self.with_github_view(|v| v.back()),
+            (KeyCode::Char('r'), _) => {
+                self.with_github_view(|v| v.refresh_all());
+                self.status = "Refreshed GitHub view".into();
+            }
+            (KeyCode::Char('R'), _) => self.github_view_rerun(false),
+            (KeyCode::Char('F'), _) => self.github_view_rerun(true),
+            (KeyCode::Char('X'), _) => self.github_view_cancel(),
+            (KeyCode::Char('c'), _) => self.github_view_checkout_pr(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn with_github_view(&mut self, mut f: impl FnMut(&mut crate::views::github::GithubView)) {
+        if let Some(view) = self.active_state().and_then(|s| s.github_view.as_mut()) {
+            f(view);
+        }
+    }
+
+    fn github_view_rerun(&mut self, failed_only: bool) {
+        let result = self
+            .active_state()
+            .and_then(|s| s.github_view.as_mut())
+            .map(|v| v.rerun_selected(failed_only));
+        match result {
+            Some(Ok(out)) => self.status = git_first_line(&out, "Re-ran"),
+            Some(Err(e)) => self.status = format!("rerun failed: {}", git_first_line(&e, "")),
+            None => {}
+        }
+    }
+
+    fn github_view_cancel(&mut self) {
+        let result = self
+            .active_state()
+            .and_then(|s| s.github_view.as_mut())
+            .map(|v| v.cancel_selected_run());
+        match result {
+            Some(Ok(out)) => self.status = git_first_line(&out, "Cancelled"),
+            Some(Err(e)) => self.status = format!("cancel failed: {}", git_first_line(&e, "")),
+            None => {}
+        }
+    }
+
+    fn github_view_checkout_pr(&mut self) {
+        let result = self
+            .active_state()
+            .and_then(|s| s.github_view.as_mut())
+            .map(|v| v.checkout_selected_pr());
+        match result {
+            Some(Ok(out)) => {
+                self.status = git_first_line(&out, "Checked out PR");
+                let _ = self.refresh_git_status();
+            }
+            Some(Err(e)) => self.status = format!("pr checkout failed: {}", git_first_line(&e, "")),
+            None => {}
+        }
+    }
+
+    fn git_view_start_new_worktree(&mut self) {
+        let Some(project_id) = self.active_project().map(|p| p.id) else {
+            self.status = "No active project".into();
+            return;
+        };
+        self.worktree_prompt = Some(WorktreePromptState {
+            project_id,
+            buffer: String::new(),
+            cursor: 0,
+        });
+        self.mode = AppMode::WorktreePrompt;
+    }
+
+    fn cancel_worktree_prompt(&mut self) {
+        self.worktree_prompt = None;
+        self.mode = AppMode::Normal;
+    }
+
+    fn commit_worktree_prompt(&mut self) -> Result<()> {
+        let Some(st) = self.worktree_prompt.take() else {
+            self.mode = AppMode::Normal;
+            return Ok(());
+        };
+        self.mode = AppMode::Normal;
+        let branch = st.buffer.trim().to_string();
+        if branch.is_empty() {
+            self.status = "Worktree creation cancelled (empty branch)".into();
+            return Ok(());
+        }
+        let project = self
+            .open_projects
+            .iter()
+            .find(|p| p.id == st.project_id)
+            .cloned();
+        let Some(project) = project else {
+            self.status = "Project no longer open".into();
+            return Ok(());
+        };
+        let path = derive_worktree_path(&project.path, &branch);
+        let result = crate::git::add_worktree(&project.path, &path, &branch, true);
+        match result {
+            Ok(out) => {
+                self.status = git_first_line(&out, &format!("Worktree created at {}", path.display()));
+                if let Some(view) = self
+                    .project_views
+                    .get_mut(&project.id)
+                    .and_then(|s| s.git_view.as_mut())
+                {
+                    view.load_worktrees();
+                }
+            }
+            Err(e) => {
+                self.status = format!("worktree add failed: {}", git_first_line(&e, ""));
+            }
+        }
+        Ok(())
+    }
+
+    fn on_key_worktree_prompt(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(st) = self.worktree_prompt.as_mut() else {
+            self.mode = AppMode::Normal;
+            return Ok(());
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.cancel_worktree_prompt(),
+            (KeyCode::Enter, _) => self.commit_worktree_prompt()?,
+            (KeyCode::Backspace, _) => {
+                if st.cursor > 0 {
+                    let chars: Vec<char> = st.buffer.chars().collect();
+                    let new_chars: Vec<char> = chars
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| if i + 1 == st.cursor { None } else { Some(*c) })
+                        .collect();
+                    st.buffer = new_chars.iter().collect();
+                    st.cursor -= 1;
+                }
+            }
+            (KeyCode::Delete, _) => {
+                let chars: Vec<char> = st.buffer.chars().collect();
+                if st.cursor < chars.len() {
+                    let new_chars: Vec<char> = chars
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| if i == st.cursor { None } else { Some(*c) })
+                        .collect();
+                    st.buffer = new_chars.iter().collect();
+                }
+            }
+            (KeyCode::Left, _) => {
+                if st.cursor > 0 {
+                    st.cursor -= 1;
+                }
+            }
+            (KeyCode::Right, _) => {
+                let len = st.buffer.chars().count();
+                if st.cursor < len {
+                    st.cursor += 1;
+                }
+            }
+            (KeyCode::Home, _) => st.cursor = 0,
+            (KeyCode::End, _) => st.cursor = st.buffer.chars().count(),
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) => {
+                let mut chars: Vec<char> = st.buffer.chars().collect();
+                chars.insert(st.cursor, c);
+                st.buffer = chars.iter().collect();
+                st.cursor += 1;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn start_new_file(&mut self) {
+        let Some(parent) = self.selected_dir_for_create() else {
+            self.status = "No project open".into();
+            return;
+        };
+        self.file_prompt = Some(FilePromptState {
+            kind: FilePromptKind::NewFile,
+            parent,
+            source: None,
+            buffer: String::new(),
+            cursor: 0,
+        });
+        self.mode = AppMode::FilePrompt;
+    }
+
+    pub fn start_new_dir(&mut self) {
+        let Some(parent) = self.selected_dir_for_create() else {
+            self.status = "No project open".into();
+            return;
+        };
+        self.file_prompt = Some(FilePromptState {
+            kind: FilePromptKind::NewDir,
+            parent,
+            source: None,
+            buffer: String::new(),
+            cursor: 0,
+        });
+        self.mode = AppMode::FilePrompt;
+    }
+
+    pub fn start_rename_file(&mut self) {
+        let Some(path) = self
+            .active_state_ref()
+            .and_then(|s| s.selected_path().map(|p| p.to_path_buf()))
+        else {
+            self.status = "No file selected".into();
+            return;
+        };
+        let parent = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cursor = name.chars().count();
+        self.file_prompt = Some(FilePromptState {
+            kind: FilePromptKind::Rename,
+            parent,
+            source: Some(path),
+            buffer: name,
+            cursor,
+        });
+        self.mode = AppMode::FilePrompt;
+    }
+
+    fn cancel_file_prompt(&mut self) {
+        self.file_prompt = None;
+        self.mode = AppMode::Normal;
+    }
+
+    fn commit_file_prompt(&mut self) {
+        let Some(st) = self.file_prompt.take() else {
+            self.mode = AppMode::Normal;
+            return;
+        };
+        self.mode = AppMode::Normal;
+        let name = st.buffer.trim().to_string();
+        if name.is_empty() {
+            self.status = "Cancelled (empty name)".into();
+            return;
+        }
+        let target = st.parent.join(&name);
+        match st.kind {
+            FilePromptKind::NewFile => match std::fs::write(&target, b"") {
+                Ok(_) => {
+                    self.status = format!("Created {}", display_relative(&target, &st.parent));
+                    self.refresh_active_tree();
+                    self.reveal_in_tree(&target);
+                }
+                Err(e) => self.status = format!("Create failed: {}", e),
+            },
+            FilePromptKind::NewDir => match std::fs::create_dir_all(&target) {
+                Ok(_) => {
+                    self.status = format!("Created {}/", display_relative(&target, &st.parent));
+                    self.refresh_active_tree();
+                    self.reveal_in_tree(&target);
+                }
+                Err(e) => self.status = format!("Create dir failed: {}", e),
+            },
+            FilePromptKind::Rename => {
+                let Some(source) = st.source else {
+                    self.status = "Rename: no source".into();
+                    return;
+                };
+                if target == source {
+                    return;
+                }
+                match std::fs::rename(&source, &target) {
+                    Ok(_) => {
+                        self.status =
+                            format!("Renamed → {}", display_relative(&target, &st.parent));
+                        self.refresh_active_tree();
+                        self.reveal_in_tree(&target);
+                    }
+                    Err(e) => self.status = format!("Rename failed: {}", e),
+                }
+            }
+        }
+    }
+
+    fn on_key_file_prompt(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(st) = self.file_prompt.as_mut() else {
+            self.mode = AppMode::Normal;
+            return Ok(());
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.cancel_file_prompt(),
+            (KeyCode::Enter, _) => self.commit_file_prompt(),
+            (KeyCode::Backspace, _) => {
+                if st.cursor > 0 {
+                    let chars: Vec<char> = st.buffer.chars().collect();
+                    let new_chars: Vec<char> = chars
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| if i + 1 == st.cursor { None } else { Some(*c) })
+                        .collect();
+                    st.buffer = new_chars.iter().collect();
+                    st.cursor -= 1;
+                }
+            }
+            (KeyCode::Delete, _) => {
+                let chars: Vec<char> = st.buffer.chars().collect();
+                if st.cursor < chars.len() {
+                    let new_chars: Vec<char> = chars
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| if i == st.cursor { None } else { Some(*c) })
+                        .collect();
+                    st.buffer = new_chars.iter().collect();
+                }
+            }
+            (KeyCode::Left, _) => {
+                if st.cursor > 0 {
+                    st.cursor -= 1;
+                }
+            }
+            (KeyCode::Right, _) => {
+                let len = st.buffer.chars().count();
+                if st.cursor < len {
+                    st.cursor += 1;
+                }
+            }
+            (KeyCode::Home, _) => st.cursor = 0,
+            (KeyCode::End, _) => st.cursor = st.buffer.chars().count(),
+            (KeyCode::Char(c), m)
+                if !m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) =>
+            {
+                let mut chars: Vec<char> = st.buffer.chars().collect();
+                chars.insert(st.cursor, c);
+                st.buffer = chars.iter().collect();
+                st.cursor += 1;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn yank_selected_file(&mut self) {
+        let Some(path) = self
+            .active_state_ref()
+            .and_then(|s| s.selected_path().map(|p| p.to_path_buf()))
+        else {
+            self.status = "No file selected".into();
+            return;
+        };
+        self.file_yank = Some(path.clone());
+        self.status = format!(
+            "Yanked {}",
+            path.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+    }
+
+    pub fn paste_yanked_file(&mut self) {
+        let Some(source) = self.file_yank.clone() else {
+            self.status = "Nothing to paste — yank a file with `c` first".into();
+            return;
+        };
+        let Some(dest_dir) = self.selected_dir_for_create() else {
+            self.status = "No paste destination".into();
+            return;
+        };
+        let base_name = source
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        let target = unique_target_path(&dest_dir, &base_name);
+        let result = if source.is_dir() {
+            copy_dir_recursive(&source, &target)
+        } else {
+            std::fs::copy(&source, &target).map(|_| ()).map_err(|e| e.to_string())
+        };
+        match result {
+            Ok(_) => {
+                self.status = format!("Copied → {}", display_relative(&target, &dest_dir));
+                self.refresh_active_tree();
+                self.reveal_in_tree(&target);
+            }
+            Err(e) => self.status = format!("Paste failed: {}", e),
+        }
+    }
+
+    pub fn start_delete_file(&mut self) {
+        let Some(path) = self
+            .active_state_ref()
+            .and_then(|s| s.selected_path().map(|p| p.to_path_buf()))
+        else {
+            self.status = "No file selected".into();
+            return;
+        };
+        self.pending_delete_file = Some(path);
+        self.mode = AppMode::ConfirmDeleteFile;
+    }
+
+    fn cancel_delete_file(&mut self) {
+        self.pending_delete_file = None;
+        self.mode = AppMode::Normal;
+    }
+
+    fn confirm_delete_file(&mut self) {
+        let Some(path) = self.pending_delete_file.take() else {
+            self.mode = AppMode::Normal;
+            return;
+        };
+        self.mode = AppMode::Normal;
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
+        } else {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())
+        };
+        match result {
+            Ok(_) => {
+                self.status = format!(
+                    "Deleted {}",
+                    path.file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                );
+                self.refresh_active_tree();
+            }
+            Err(e) => self.status = format!("Delete failed: {}", e),
+        }
+    }
+
+    fn on_key_confirm_delete_file(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) | (KeyCode::Enter, _) => {
+                self.confirm_delete_file();
+            }
+            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
+                self.cancel_delete_file();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn selected_dir_for_create(&self) -> Option<PathBuf> {
+        let project_root = self.active_project()?.path.clone();
+        let selected = self
+            .active_state_ref()
+            .and_then(|s| s.selected_path().map(|p| p.to_path_buf()));
+        match selected {
+            Some(p) if p.is_dir() => Some(p),
+            Some(p) => p.parent().map(|x| x.to_path_buf()),
+            None => Some(project_root),
+        }
+    }
+
+    fn refresh_active_tree(&mut self) {
+        if let Some(state) = self.active_state() {
+            state.tree.refresh();
+        }
+        let _ = self.refresh_git_status();
+    }
+
+    fn reveal_in_tree(&mut self, path: &Path) {
+        if let Some(state) = self.active_state() {
+            state.tree.reveal_path(path);
+        }
+    }
+
     fn open_or_focus_terminal(&mut self) -> Result<()> {
         let already_has = self
             .active_state_ref()
@@ -2497,11 +4453,14 @@ impl App {
     }
 
     fn new_terminal(&mut self) -> Result<()> {
-        let shell = self.shell_config.clone();
-        let Some(project_path) = self.active_project().map(|p| p.path.clone()) else {
+        let Some((project_id, project_path)) = self
+            .active_project()
+            .map(|p| (p.id, p.path.clone()))
+        else {
             self.status = "No active project".into();
             return Ok(());
         };
+        let shell = self.effective_shell_config(project_id);
         match crate::views::terminal::TerminalView::spawn(&shell, &project_path, 24, 80) {
             Ok(term) => {
                 if let Some(state) = self.active_state() {
@@ -2583,7 +4542,8 @@ impl App {
             state.view_mode = ViewMode::Agents;
         }
         self.ensure_agents_restored()?;
-        self.new_agent()?;
+        let agent_name = format_feature_agent_name(feature_id, &feature_title);
+        self.spawn_agent_for_project(&project, None, true, Some(agent_name))?;
 
         let message = format!(
             "Take feature #{id} \"{title}\". Start by reading {dir}/index.md, then {dir}/features/{file}. \
@@ -2594,9 +4554,15 @@ impl App {
             dir = context_dir.display(),
             file = feature_file,
         );
-        let mut bytes = message.into_bytes();
+        let mut bytes = bracketed_paste_bytes(&message);
         bytes.push(b'\r');
-        self.write_to_active_agent(&bytes);
+        if let Some(state) = self.active_state() {
+            if let Some(i) = state.active_agent {
+                if let Some(agent) = state.agents.get_mut(i) {
+                    agent.queue_initial_input(bytes);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2605,7 +4571,7 @@ impl App {
             self.status = "No active project".into();
             return Ok(());
         };
-        self.spawn_agent_for_project(&project, resume_session_id, true)
+        self.spawn_agent_for_project(&project, resume_session_id, true, None)
     }
 
     fn spawn_agent_for_project(
@@ -2613,8 +4579,9 @@ impl App {
         project: &Project,
         resume_session_id: Option<String>,
         focus_agents_view: bool,
+        name_override: Option<String>,
     ) -> Result<()> {
-        let ai = self.ai_config.clone();
+        let ai = self.effective_ai_config(project.id);
         let context_dir = self.write_agent_project_context(project.id, &project.name)?;
         let prompt = self.agent_system_prompt(&project.name, project.id, &context_dir);
         let count = self
@@ -2623,7 +4590,9 @@ impl App {
             .map(|s| s.agents.len())
             .unwrap_or(0);
         let suffix = if resume_session_id.is_some() { " (resumed)" } else { "" };
-        let name = format!("{} #{}{}", ai.provider, count + 1, suffix);
+        let name = name_override
+            .map(|n| if resume_session_id.is_some() { format!("{}{}", n, suffix) } else { n })
+            .unwrap_or_else(|| format!("{} #{}{}", ai.provider, count + 1, suffix));
         match crate::views::agents::AgentSession::spawn(
             &ai,
             name,
@@ -2669,7 +4638,7 @@ impl App {
             }
             let saved = self.db.load_agent_sessions(p.id).unwrap_or_default();
             for id in saved {
-                self.spawn_agent_for_project(&p, Some(id), false)?;
+                self.spawn_agent_for_project(&p, Some(id), false, None)?;
             }
         }
         Ok(())
@@ -2796,10 +4765,13 @@ This keeps the Project tab as the source of truth for the conversation history."
 
     fn close_active_agent(&mut self) {
         let project_id = self.active_project().map(|p| p.id);
+        let mut closed_name = None;
         if let Some(state) = self.active_state() {
             if let Some(i) = state.active_agent {
                 if i < state.agents.len() {
-                    state.agents.remove(i);
+                    let mut session = state.agents.remove(i);
+                    closed_name = Some(session.name.clone());
+                    session.shutdown();
                 }
                 if state.agents.is_empty() {
                     state.active_agent = None;
@@ -2811,6 +4783,9 @@ This keeps the Project tab as the source of truth for the conversation history."
         }
         if let Some(id) = project_id {
             self.persist_agent_sessions(id);
+        }
+        if let Some(name) = closed_name {
+            self.status = format!("Closed agent: {}", name);
         }
     }
 
@@ -2846,6 +4821,8 @@ This keeps the Project tab as the source of truth for the conversation history."
             KeyCode::Char('T') => self.new_terminal(),
             KeyCode::Char('P') => self.open_project_view(),
             KeyCode::Char('G') => self.open_git_view(),
+            KeyCode::Char('H') => self.open_github_view(),
+            KeyCode::Char('r') => self.open_runtime_view(),
             KeyCode::Char('a') => self.agent_for_selected_feature(),
             KeyCode::Char('z') => {
                 self.cycle_editor_wrap();
@@ -2880,12 +4857,48 @@ This keeps the Project tab as the source of truth for the conversation history."
         if let Some(state) = self.active_state() {
             if let Some(i) = state.active_agent {
                 if let Some(agent) = state.agents.get_mut(i) {
+                    agent.cancel_initial_input();
+                    agent.clear_selection();
                     agent.reset_scrollback();
                     agent.write_bytes(bytes);
                 }
             }
         }
         self.capture_active_agent_session();
+    }
+
+    fn paste_into_active_agent(&mut self) {
+        let Some(text) = crate::clipboard::paste() else {
+            self.status = "Clipboard is empty".into();
+            return;
+        };
+        if text.is_empty() {
+            self.status = "Clipboard is empty".into();
+            return;
+        }
+        let bytes = bracketed_paste_bytes(&text);
+        self.write_to_active_agent(&bytes);
+        self.status = format!("Pasted {} chars", text.chars().count());
+    }
+
+    pub fn on_paste(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(view) = self.current_view_mode() else { return };
+        match view {
+            ViewMode::Agents => {
+                let bytes = bracketed_paste_bytes(&text);
+                self.write_to_active_agent(&bytes);
+                self.status = format!("Pasted {} chars", text.chars().count());
+            }
+            ViewMode::Terminal => {
+                let bytes = bracketed_paste_bytes(&text);
+                self.write_to_active_terminal(&bytes);
+                self.status = format!("Pasted {} chars", text.chars().count());
+            }
+            _ => {}
+        }
     }
 
     fn on_key_agents(&mut self, key: KeyEvent) -> Result<()> {
@@ -2916,6 +4929,14 @@ This keeps the Project tab as the source of truth for the conversation history."
                     self.close_active_agent();
                     return Ok(());
                 }
+                KeyCode::Char('r') => {
+                    self.start_rename_active_agent();
+                    return Ok(());
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    self.paste_into_active_agent();
+                    return Ok(());
+                }
                 KeyCode::Char(' ') => {
                     self.write_to_active_agent(&[0]);
                     return Ok(());
@@ -2932,6 +4953,12 @@ This keeps the Project tab as the source of truth for the conversation history."
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
             self.write_to_active_agent(&[0x03]);
+            return Ok(());
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        {
+            self.paste_into_active_agent();
             return Ok(());
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2985,6 +5012,10 @@ This keeps the Project tab as the source of truth for the conversation history."
                     self.close_active_terminal();
                     return Ok(());
                 }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    self.paste_into_active_terminal();
+                    return Ok(());
+                }
                 KeyCode::Char(' ') => {
                     let bytes = vec![0];
                     self.write_to_active_terminal(&bytes);
@@ -3002,6 +5033,12 @@ This keeps the Project tab as the source of truth for the conversation history."
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
             self.write_to_active_terminal(&[0x03]);
+            return Ok(());
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        {
+            self.paste_into_active_terminal();
             return Ok(());
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -3037,6 +5074,14 @@ This keeps the Project tab as the source of truth for the conversation history."
             return self.on_key_project_editing(key);
         }
         match (key.code, key.modifiers) {
+            (KeyCode::Char('e'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.project_scroll_preview(1)
+            }
+            (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.project_scroll_preview(-1)
+            }
+            (KeyCode::PageDown, _) => self.project_scroll_preview(5),
+            (KeyCode::PageUp, _) => self.project_scroll_preview(-5),
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.project_move_down(),
             (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.project_move_up(),
             (KeyCode::Char('g'), m) if !m.contains(KeyModifiers::CONTROL) => self.project_jump_top(),
@@ -3112,20 +5157,25 @@ This keeps the Project tab as the source of truth for the conversation history."
             return Ok(());
         }
         if alt && matches!(key.code, KeyCode::Char('1')) {
-            self.with_feature_form(|f| f.switch_to_details());
+            self.with_feature_form(|f| f.focus_title());
             return Ok(());
         }
         if alt && matches!(key.code, KeyCode::Char('2')) {
-            self.with_feature_form(|f| f.switch_to_comments());
+            self.with_feature_form(|f| f.focus_first_comment());
             return Ok(());
         }
-        if matches!(key.code, KeyCode::Tab) {
-            self.with_feature_form(|f| f.toggle_page());
-            return Ok(());
-        }
-        if matches!(key.code, KeyCode::BackTab) {
-            self.with_feature_form(|f| f.toggle_page());
-            return Ok(());
+        if ctrl {
+            match key.code {
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    self.with_feature_form(|f| f.scroll_lines(1));
+                    return Ok(());
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.with_feature_form(|f| f.scroll_lines(-1));
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
         let editor_open = self
             .active_state_ref()
@@ -3170,15 +5220,14 @@ This keeps the Project tab as the source of truth for the conversation history."
                 self.with_feature_form(|f| f.focus_prev());
             }
             (KeyCode::Left, _) | (KeyCode::Char('h'), _) => {
-                self.with_feature_form(|f| f.status_cursor_left());
+                self.with_feature_form(|f| f.cycle_status_prev());
             }
             (KeyCode::Right, _) | (KeyCode::Char('l'), _) => {
-                self.with_feature_form(|f| f.status_cursor_right());
+                self.with_feature_form(|f| f.cycle_status());
             }
-            (KeyCode::Enter, _) | (KeyCode::Char(' '), _) => {
-                self.with_feature_form(|f| f.apply_status_cursor());
-            }
-            (KeyCode::Char('x'), _) => {
+            (KeyCode::Enter, _)
+            | (KeyCode::Char(' '), _)
+            | (KeyCode::Char('x'), _) => {
                 self.with_feature_form(|f| f.cycle_status());
             }
             _ => {}
@@ -3398,6 +5447,15 @@ This keeps the Project tab as the source of truth for the conversation history."
             .and_then(|s| s.project_view.as_mut())
         {
             model.jump_bottom();
+        }
+    }
+
+    fn project_scroll_preview(&mut self, delta: i32) {
+        if let Some(model) = self
+            .active_state()
+            .and_then(|s| s.project_view.as_mut())
+        {
+            model.scroll_preview(delta);
         }
     }
 
@@ -3702,11 +5760,26 @@ This keeps the Project tab as the source of truth for the conversation history."
         if let Some(state) = self.active_state() {
             if let Some(i) = state.active_terminal {
                 if let Some(term) = state.terminals.get_mut(i) {
+                    term.clear_selection();
                     term.reset_scrollback();
                     term.write_bytes(bytes);
                 }
             }
         }
+    }
+
+    fn paste_into_active_terminal(&mut self) {
+        let Some(text) = crate::clipboard::paste() else {
+            self.status = "Clipboard is empty".into();
+            return;
+        };
+        if text.is_empty() {
+            self.status = "Clipboard is empty".into();
+            return;
+        }
+        let bytes = bracketed_paste_bytes(&text);
+        self.write_to_active_terminal(&bytes);
+        self.status = format!("Pasted {} chars", text.chars().count());
     }
 
     fn open_explorer_filter(&mut self) {
@@ -3723,7 +5796,8 @@ This keeps the Project tab as the source of truth for the conversation history."
 
     fn open_grep(&mut self) {
         if let Some(p) = self.active_project().cloned() {
-            self.grep = Some(GrepView::new(p.path, self.search_excludes.clone()));
+            let excludes = self.effective_search_excludes(p.id);
+            self.grep = Some(GrepView::new(p.path, excludes));
             self.mode = AppMode::Grep;
         }
     }
@@ -3882,6 +5956,59 @@ fn format_range(part: &str, sign: char) -> String {
     }
 }
 
+fn display_relative(path: &Path, base: &Path) -> String {
+    path.strip_prefix(base)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| {
+            path.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        })
+}
+
+fn unique_target_path(dir: &Path, name: &str) -> PathBuf {
+    let base = dir.join(name);
+    if !base.exists() {
+        return base;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{}", e)),
+        _ => (name.to_string(), String::new()),
+    };
+    for i in 1..1000 {
+        let candidate = dir.join(format!("{} copy{}{}", stem, if i == 1 { String::new() } else { format!(" {}", i) }, ext));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{} copy.{}", stem, std::process::id()))
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let ft = entry.file_type().map_err(|e| e.to_string())?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = Vec::with_capacity(normalized.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(normalized.as_bytes());
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
 fn git_first_line(text: &str, fallback: &str) -> String {
     let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     if first.is_empty() {
@@ -3889,6 +6016,65 @@ fn git_first_line(text: &str, fallback: &str) -> String {
     } else {
         first.to_string()
     }
+}
+
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or(text).to_string()
+}
+
+fn match_runtime_keyword(input: &str, keyword: &str) -> Option<String> {
+    let rest = input.strip_prefix(keyword)?;
+    if rest.is_empty() {
+        return Some(String::new());
+    }
+    if rest.starts_with(char::is_whitespace) {
+        return Some(rest.trim().to_string());
+    }
+    None
+}
+
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let cb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    ca == cb
+}
+
+pub fn preview_worktree_path(repo: &Path, branch: &str) -> PathBuf {
+    derive_worktree_path(repo, branch)
+}
+
+fn derive_worktree_path(repo: &Path, branch: &str) -> PathBuf {
+    let parent = repo.parent().unwrap_or(repo);
+    let base = repo
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project");
+    let safe: String = branch
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ' ' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            other => other,
+        })
+        .collect();
+    parent.join(format!("{}-{}", base, safe))
+}
+
+fn format_feature_agent_name(feature_id: i64, feature_title: &str) -> String {
+    const MAX: usize = 28;
+    let title = feature_title.trim();
+    let prefix = format!("#{} ", feature_id);
+    let room = MAX.saturating_sub(prefix.chars().count());
+    let chars: Vec<char> = title.chars().collect();
+    let trimmed_title: String = if chars.len() <= room {
+        chars.iter().collect()
+    } else if room <= 1 {
+        "…".to_string()
+    } else {
+        let mut s: String = chars[..room - 1].iter().collect();
+        s.push('…');
+        s
+    };
+    format!("{}{}", prefix, trimmed_title)
 }
 
 fn contains(rect: Rect, col: u16, row: u16) -> bool {

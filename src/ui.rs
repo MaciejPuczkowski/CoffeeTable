@@ -1,5 +1,5 @@
 use crate::{
-    app::{AiCommitState, App, AppMode, Focus, LeftPaneMode},
+    app::{AiCommitState, App, AppMode, Focus, FocusContext, LeftPaneMode, SettingsPane},
     views::{
         changes::ChangesWidget,
         editor::{COMMANDS, EditorMode, EditorWidget, filter_commands, render_command_line},
@@ -26,6 +26,7 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
             Constraint::Min(5),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -43,10 +44,13 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         crate::app::ViewMode::Agents => render_agents_body(app, frame, body_area),
         crate::app::ViewMode::Project => render_project_body(app, frame, body_area),
         crate::app::ViewMode::Git => render_git_body(app, frame, body_area),
+        crate::app::ViewMode::Github => render_github_body(app, frame, body_area),
+        crate::app::ViewMode::Runtime => render_runtime_body(app, frame, body_area),
         crate::app::ViewMode::Editor => render_body(app, frame, body_area),
     }
     render_command_or_status(app, frame, chunks[3]);
     render_footer(app, frame, chunks[4]);
+    render_status_toolbar(app, frame, chunks[5]);
 
     match app.mode {
         AppMode::Picker => render_picker_overlay(app, frame, area),
@@ -55,6 +59,11 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         AppMode::ConfirmDeleteFeature => render_delete_feature_overlay(app, frame, area),
         AppMode::Palette => render_command_palette_overlay(app, frame, area),
         AppMode::AiCommit => render_ai_commit_overlay(app, frame, area),
+        AppMode::Settings => render_settings_overlay(app, frame, area),
+        AppMode::AgentRename => render_agent_rename_overlay(app, frame, area),
+        AppMode::WorktreePrompt => render_worktree_prompt_overlay(app, frame, area),
+        AppMode::FilePrompt => render_file_prompt_overlay(app, frame, area),
+        AppMode::ConfirmDeleteFile => render_delete_file_overlay(app, frame, area),
         AppMode::Normal | AppMode::ExplorerFilter => {}
     }
     if app.leader_pending {
@@ -155,6 +164,7 @@ fn render_terminal_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
         ("l", "Next tab"),
         ("h", "Previous tab"),
         ("x", "Close current tab"),
+        ("r", "Rename current agent (Agents only)"),
         ("Space", "Send literal Ctrl+Space"),
         ("p", "Projects (picker)"),
         ("f", "Find file"),
@@ -168,6 +178,7 @@ fn render_terminal_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
         ("T", "New terminal"),
         ("P", "Project view"),
         ("G", "Git view (branches + commits)"),
+        ("r", "Runtime view (services)"),
         ("a", "Agent for selected feature"),
         ("L", "Toggle Agents lane (right side)"),
         ("z", "Toggle wrap (none / 120 / 80)"),
@@ -221,6 +232,7 @@ fn render_leader_overlay(frame: &mut Frame<'_>, area: Rect) {
         ("T", "New terminal (always create)"),
         ("P", "Project view (meta + features)"),
         ("G", "Git view (branches + commits)"),
+        ("r", "Runtime view (services)"),
         ("a", "Agent for selected feature"),
         ("L", "Toggle Agents lane (right side)"),
         ("z", "Toggle wrap (none / 120 / 80)"),
@@ -275,22 +287,42 @@ fn render_view_tabs(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         .and_then(|p| app.project_views.get(&p.id))
         .map(|s| s.view_mode)
         .unwrap_or(crate::app::ViewMode::Editor);
+    let focused = matches!(app.focus_context, FocusContext::ViewTabs);
+    let github_available = app.github_available_for_active();
+    let project_enabled = app
+        .open_projects
+        .get(app.active_index)
+        .map(|p| app.is_project_view_enabled(p.id))
+        .unwrap_or(true);
     let mut spans: Vec<Span> = Vec::new();
-    let mut x = area.x + 1;
-    for (mode, label) in &[
+    let marker = if focused { "▶ " } else { "  " };
+    spans.push(Span::styled(
+        marker,
+        Style::default().fg(if focused { Color::Yellow } else { Color::DarkGray }),
+    ));
+    let mut x = area.x + marker.chars().count() as u16;
+    let mut tabs: Vec<(crate::app::ViewMode, &str)> = vec![
         (crate::app::ViewMode::Editor, "Editor"),
         (crate::app::ViewMode::Terminal, "Terminal"),
         (crate::app::ViewMode::Agents, "Agents"),
-        (crate::app::ViewMode::Project, "Project"),
-        (crate::app::ViewMode::Git, "Git"),
-    ] {
+    ];
+    if project_enabled {
+        tabs.push((crate::app::ViewMode::Project, "Project"));
+    }
+    tabs.push((crate::app::ViewMode::Runtime, "Runtime"));
+    tabs.push((crate::app::ViewMode::Git, "Git"));
+    if github_available {
+        tabs.push((crate::app::ViewMode::Github, "GitHub"));
+    }
+    for (mode, label) in &tabs {
         let text = format!(" {} ", label);
         let w = text.chars().count() as u16;
         let style = if active_view == *mode {
-            Style::default()
-                .bg(Color::Yellow)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
+            let bg = if focused { Color::Yellow } else { Color::Yellow };
+            let fg = if focused { Color::Black } else { Color::Black };
+            Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD)
+        } else if focused {
+            Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -322,7 +354,7 @@ fn render_project_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     }
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Min(20)])
+        .constraints([Constraint::Percentage(app.split_pct), Constraint::Min(20)])
         .split(area);
     app.left_pane_area = chunks[0];
     app.right_pane_area = chunks[1];
@@ -410,12 +442,10 @@ fn render_project_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
 
     if model.feature_form.is_some() {
         let rects = render_feature_form(model, chunks[1], frame, editor_focused);
-        app.feature_form_tab_rects = rects.tabs;
         app.feature_form_field_rects = rects.fields;
         app.feature_form_status_rects = rects.statuses;
         return;
     }
-    app.feature_form_tab_rects.clear();
     app.feature_form_field_rects.clear();
     app.feature_form_status_rects.clear();
 
@@ -491,6 +521,7 @@ fn render_project_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         }
         ProjectSelection::Feature(i) => {
             if let Some(feature) = model.features.get(i) {
+                let wrap_width = (inner.width as usize).min(120).max(10);
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("  {} ", feature.title),
@@ -510,8 +541,8 @@ fn render_project_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     )));
                 } else {
-                    for l in feature.description.lines() {
-                        lines.push(Line::from(format!("  {}", l)));
+                    for w in wrap_paragraph(&feature.description, wrap_width.saturating_sub(2)) {
+                        lines.push(Line::from(format!("  {}", w)));
                     }
                 }
                 lines.push(Line::from(""));
@@ -559,11 +590,27 @@ fn render_project_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
                             CommentStatus::Sent => Style::default().fg(Color::Cyan),
                             CommentStatus::Done => Style::default().fg(Color::Green),
                         };
-                        lines.push(Line::from(vec![
-                            Span::raw("    "),
-                            Span::styled(format!("[{}] ", c.status.label()), badge_style),
-                            Span::raw(c.message.clone()),
-                        ]));
+                        let head = format!("    [{}] ", c.status.label());
+                        let head_len = head.chars().count();
+                        let avail = wrap_width.saturating_sub(head_len).max(8);
+                        let wrapped = wrap_paragraph(&c.message, avail);
+                        if wrapped.is_empty() {
+                            lines.push(Line::from(vec![Span::styled(head, badge_style)]));
+                        } else {
+                            for (j, w) in wrapped.into_iter().enumerate() {
+                                if j == 0 {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(head.clone(), badge_style),
+                                        Span::raw(w),
+                                    ]));
+                                } else {
+                                    let pad: String =
+                                        std::iter::repeat(' ').take(head_len).collect();
+                                    lines
+                                        .push(Line::from(vec![Span::raw(pad), Span::raw(w)]));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -576,12 +623,16 @@ fn render_project_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "  ? for full help • Ctrl+J/K switch view",
+            "  Ctrl+E/Y scroll preview • ? for full help",
             Style::default().fg(Color::DarkGray),
         )),
     ];
     lines.extend(hints);
-    frame.render_widget(Paragraph::new(lines), inner);
+    let total = lines.len() as u16;
+    let max_scroll = total.saturating_sub(inner.height);
+    let scroll = model.preview_scroll.min(max_scroll);
+    model.preview_scroll = scroll;
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
 }
 
 fn render_git_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
@@ -602,7 +653,7 @@ fn render_git_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Min(20)])
+        .constraints([Constraint::Percentage(app.split_pct), Constraint::Min(20)])
         .split(area);
     app.left_pane_area = chunks[0];
     app.right_pane_area = chunks[1];
@@ -728,6 +779,7 @@ fn render_git_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         DetailsMode::Commit => "",
         DetailsMode::PrList => "[PRs] ",
         DetailsMode::PrView => "[PR] ",
+        DetailsMode::Worktrees => "[Worktrees] ",
     };
     let details_block = Block::default()
         .borders(Borders::ALL)
@@ -742,6 +794,204 @@ fn render_git_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         .collect();
     let para = Paragraph::new(lines).scroll((view.details_scroll, 0));
     frame.render_widget(para, inner);
+}
+
+fn render_github_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
+    use crate::views::github::GhPane;
+    use ratatui::widgets::{List, ListItem, ListState, StatefulWidget};
+
+    let Some(project) = app.open_projects.get(app.active_index).cloned() else {
+        return;
+    };
+    let needs_load = app
+        .project_views
+        .get(&project.id)
+        .map(|s| s.github_view.is_none())
+        .unwrap_or(false);
+    if needs_load {
+        app.ensure_github_view_loaded();
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(app.split_pct), Constraint::Min(20)])
+        .split(area);
+    app.left_pane_area = chunks[0];
+    app.right_pane_area = chunks[1];
+
+    let left_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Min(3)])
+        .split(chunks[0]);
+
+    let Some(state) = app.project_views.get_mut(&project.id) else {
+        return;
+    };
+    let Some(view) = state.github_view.as_mut() else {
+        let p = Paragraph::new("GitHub view unavailable.")
+            .block(Block::default().borders(Borders::ALL).title(" GitHub "));
+        frame.render_widget(p, area);
+        return;
+    };
+    view.runs_area = left_split[0];
+    view.prs_area = left_split[1];
+    view.details_area = chunks[1];
+
+    let runs_focused = matches!(view.focus, GhPane::Runs);
+    let prs_focused = matches!(view.focus, GhPane::Prs);
+    let details_focused = matches!(view.focus, GhPane::Details);
+
+    let runs_title = if view.runs.is_empty() {
+        " Workflow runs ".to_string()
+    } else {
+        format!(" Workflow runs ({}) ", view.runs.len())
+    };
+    let mut run_items: Vec<ListItem> = Vec::with_capacity(view.runs.len());
+    for r in &view.runs {
+        let (glyph, color) = run_status_style(&r.status, &r.conclusion);
+        let workflow = truncate(&r.workflow_name, 22);
+        let branch = truncate(&r.head_branch, 18);
+        let when = format_when(&r.created_at);
+        run_items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!("{} ", glyph), Style::default().fg(color)),
+            Span::styled(
+                format!("{:<22} ", workflow),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{:<18} ", branch), Style::default().fg(Color::Cyan)),
+            Span::styled(when, Style::default().fg(Color::DarkGray)),
+        ])));
+    }
+    if run_items.is_empty() {
+        let msg = if view.repo_configured {
+            "  (no workflow runs — press 'r' to refresh)"
+        } else {
+            "  (not a GitHub repository)"
+        };
+        run_items.push(ListItem::new(Line::from(Span::styled(
+            msg,
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+    let runs_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border(runs_focused))
+        .title(runs_title);
+    let mut run_state = ListState::default();
+    run_state.select(Some(view.run_idx));
+    let runs_list = List::new(run_items)
+        .block(runs_block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    StatefulWidget::render(runs_list, left_split[0], frame.buffer_mut(), &mut run_state);
+
+    let prs_title = if view.prs.is_empty() {
+        " Pull requests ".to_string()
+    } else {
+        format!(" Pull requests ({}) ", view.prs.len())
+    };
+    let mut pr_items: Vec<ListItem> = Vec::with_capacity(view.prs.len());
+    for p in &view.prs {
+        let (glyph, color) = pr_state_style(&p.state, p.draft);
+        let title = truncate(&p.title, 60);
+        pr_items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!("{} ", glyph), Style::default().fg(color)),
+            Span::styled(
+                format!("#{:<5} ", p.number),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(title),
+            Span::styled(
+                format!("  @{}", p.author),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])));
+    }
+    if pr_items.is_empty() {
+        pr_items.push(ListItem::new(Line::from(Span::styled(
+            "  (no pull requests)",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+    let prs_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border(prs_focused))
+        .title(prs_title);
+    let mut pr_state = ListState::default();
+    pr_state.select(Some(view.pr_idx));
+    let prs_list = List::new(pr_items)
+        .block(prs_block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    StatefulWidget::render(prs_list, left_split[1], frame.buffer_mut(), &mut pr_state);
+
+    let details_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border(details_focused))
+        .title(format!(" {} ", view.details_title));
+    let inner = details_block.inner(chunks[1]);
+    frame.render_widget(details_block, chunks[1]);
+    let lines: Vec<Line> = view
+        .details_text
+        .lines()
+        .map(|l| Line::from(diff_line_style(l)))
+        .collect();
+    let para = Paragraph::new(lines).scroll((view.details_scroll, 0));
+    frame.render_widget(para, inner);
+}
+
+fn run_status_style(status: &str, conclusion: &str) -> (&'static str, Color) {
+    match status {
+        "queued" | "waiting" | "requested" | "pending" => ("◌", Color::Cyan),
+        "in_progress" => ("◐", Color::Yellow),
+        "completed" => match conclusion {
+            "success" => ("✓", Color::Green),
+            "failure" | "timed_out" | "startup_failure" => ("✗", Color::Red),
+            "cancelled" => ("⊘", Color::DarkGray),
+            "skipped" | "neutral" | "stale" => ("·", Color::DarkGray),
+            _ => ("?", Color::Magenta),
+        },
+        _ => ("?", Color::Magenta),
+    }
+}
+
+fn pr_state_style(state: &str, draft: bool) -> (&'static str, Color) {
+    if draft {
+        return ("◇", Color::DarkGray);
+    }
+    match state {
+        "OPEN" | "open" => ("●", Color::Green),
+        "MERGED" | "merged" => ("●", Color::Magenta),
+        "CLOSED" | "closed" => ("●", Color::Red),
+        _ => ("●", Color::DarkGray),
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let cut = max.saturating_sub(1);
+    let mut out: String = chars.into_iter().take(cut).collect();
+    out.push('…');
+    out
+}
+
+fn format_when(iso: &str) -> String {
+    if iso.len() >= 16 {
+        iso[..16].replace('T', " ")
+    } else {
+        iso.to_string()
+    }
 }
 
 fn pane_border(focused: bool) -> Style {
@@ -793,7 +1043,6 @@ fn feature_status_color(status: crate::project::FeatureStatus) -> Color {
 }
 
 pub struct FeatureFormRects {
-    pub tabs: Vec<(crate::views::feature_form::FormPage, Rect)>,
     pub fields: Vec<(crate::views::feature_form::FormFocus, Rect)>,
     pub statuses: Vec<(crate::project::FeatureStatus, Rect)>,
 }
@@ -804,9 +1053,8 @@ fn render_feature_form(
     frame: &mut Frame<'_>,
     focused: bool,
 ) -> FeatureFormRects {
-    use crate::views::feature_form::{FormFocus, FormPage};
+    use crate::views::feature_form::{EditorTarget, FormFocus};
     let mut rects = FeatureFormRects {
-        tabs: Vec::new(),
         fields: Vec::new(),
         statuses: Vec::new(),
     };
@@ -829,368 +1077,274 @@ fn render_feature_form(
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3)])
-        .split(inner);
-    rects.tabs = render_form_tabs(form, chunks[0], frame);
-
-    match form.page {
-        FormPage::Details => {
-            let title_focused = matches!(form.focus, FormFocus::Title);
-            let status_focused = matches!(form.focus, FormFocus::Status);
-            let desc_focused = matches!(form.focus, FormFocus::Description);
-            let steps_focused = matches!(form.focus, FormFocus::Step(_) | FormFocus::NewStep);
-
-            let details = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Length(3),
-                    Constraint::Ratio(1, 2),
-                    Constraint::Ratio(1, 2),
-                ])
-                .split(chunks[1]);
-            render_form_title(form, details[0], frame, title_focused);
-            rects.fields.push((FormFocus::Title, details[0]));
-            rects.statuses = render_form_status(form, details[1], frame, status_focused);
-            rects.fields.push((FormFocus::Status, details[1]));
-            render_form_description(form, details[2], frame, desc_focused);
-            rects.fields.push((FormFocus::Description, details[2]));
-            let step_rects = render_form_steps(form, details[3], frame, steps_focused);
-            rects.fields.extend(step_rects);
-        }
-        FormPage::Comments => {
-            let comments_focused = matches!(
-                form.focus,
-                FormFocus::Comment(_) | FormFocus::NewComment
-            );
-            let comment_rects = render_form_comments(form, chunks[1], frame, comments_focused);
-            rects.fields.extend(comment_rects);
-        }
+    if inner.width < 10 || inner.height < 1 {
+        return rects;
     }
-    rects
-}
 
-fn render_form_tabs(
-    form: &crate::views::feature_form::FeatureForm,
-    area: Rect,
-    frame: &mut Frame<'_>,
-) -> Vec<(crate::views::feature_form::FormPage, Rect)> {
-    use crate::views::feature_form::FormPage;
-    let visible_comments = form.comments.iter().filter(|c| !c.deleted).count();
-    let pages: [(FormPage, String); 2] = [
-        (FormPage::Details, " 1·Details ".to_string()),
-        (
-            FormPage::Comments,
-            format!(" 2·Messages ({}) ", visible_comments),
-        ),
-    ];
-    let mut spans: Vec<Span> = Vec::new();
-    let mut rects: Vec<(FormPage, Rect)> = Vec::new();
-    let mut x = area.x;
-    let space = Span::raw(" ");
-    spans.push(space.clone());
-    x = x.saturating_add(1);
-    for (page, label) in pages {
-        let active = page == form.page;
-        let style = if active {
-            Style::default()
-                .bg(Color::Yellow)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
+    let layout = build_feature_layout(form, focused, inner.width);
+
+    let total_height = layout.lines.len() as u16;
+    let max_scroll = total_height.saturating_sub(inner.height);
+    let scroll = form.scroll_offset.min(max_scroll);
+    form.scroll_offset = scroll;
+
+    let paragraph = Paragraph::new(layout.lines).scroll((scroll, 0));
+    frame.render_widget(paragraph, inner);
+
+    for (focus, vy, h) in layout.regions {
+        if vy + h <= scroll || vy >= scroll + inner.height {
+            continue;
+        }
+        let visible_top = vy.saturating_sub(scroll);
+        let visible_bottom = (vy + h).saturating_sub(scroll).min(inner.height);
+        let screen_y = inner.y + visible_top;
+        let screen_h = visible_bottom - visible_top;
+        if screen_h == 0 {
+            continue;
+        }
+        rects.fields.push((
+            focus,
+            Rect::new(inner.x, screen_y, inner.width, screen_h),
+        ));
+    }
+
+    for (st, vy, x_off, w) in layout.statuses {
+        if vy < scroll || vy >= scroll + inner.height {
+            continue;
+        }
+        let screen_y = inner.y + (vy - scroll);
+        let screen_x = inner.x.saturating_add(x_off);
+        let max_w = inner.width.saturating_sub(x_off);
+        let width = w.min(max_w);
+        if width == 0 {
+            continue;
+        }
+        rects
+            .statuses
+            .push((st, Rect::new(screen_x, screen_y, width, 1)));
+    }
+
+    if let Some(target) = form.editor_target {
+        let target_focus = match target {
+            EditorTarget::Description => FormFocus::Description,
+            EditorTarget::Comment(i) => FormFocus::Comment(i),
+            EditorTarget::NewComment => FormFocus::NewComment,
         };
-        let w = label.chars().count() as u16;
-        rects.push((page, Rect::new(x, area.y, w, 1)));
-        spans.push(Span::styled(label, style));
-        x = x.saturating_add(w);
-        spans.push(space.clone());
-        x = x.saturating_add(1);
-    }
-    spans.push(Span::styled(
-        " Tab to switch",
-        Style::default().fg(Color::DarkGray),
-    ));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    rects
-}
-
-fn render_form_title(
-    form: &crate::views::feature_form::FeatureForm,
-    area: Rect,
-    frame: &mut Frame<'_>,
-    focused: bool,
-) {
-    let block = field_block("Title", focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let placeholder = "(type a title)";
-    let text = form.title.as_str();
-    if focused {
-        render_inline_input(frame, inner, text, form.cursor, placeholder);
-    } else if text.trim().is_empty() {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                placeholder,
-                Style::default().fg(Color::DarkGray),
-            )),
-            inner,
-        );
-    } else {
-        frame.render_widget(Paragraph::new(Line::from(text.to_string())), inner);
-    }
-}
-
-fn render_form_status(
-    form: &crate::views::feature_form::FeatureForm,
-    area: Rect,
-    frame: &mut Frame<'_>,
-    focused: bool,
-) -> Vec<(crate::project::FeatureStatus, Rect)> {
-    use crate::project::FeatureStatus;
-    let block = field_block("Status", focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mut spans: Vec<Span> = Vec::new();
-    let mut rects: Vec<(FeatureStatus, Rect)> = Vec::new();
-    let mut x = inner.x;
-    spans.push(Span::raw(" "));
-    x = x.saturating_add(1);
-    for (i, st) in FeatureStatus::all().iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-            x = x.saturating_add(1);
-        }
-        let is_current = *st == form.status;
-        let is_cursor = focused && *st == form.status_cursor;
-        let label = format!(" {} ", st.label());
-        let color = feature_status_color(*st);
-        let style = if is_cursor {
-            Style::default()
-                .bg(color)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        } else if is_current {
-            Style::default().fg(color).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let w = label.chars().count() as u16;
-        rects.push((*st, Rect::new(x, inner.y, w, 1)));
-        spans.push(Span::styled(label, style));
-        x = x.saturating_add(w);
-        if is_current && !is_cursor {
-            spans.push(Span::styled("◆", Style::default().fg(color)));
-            x = x.saturating_add(1);
-        }
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
-    rects
-}
-
-fn render_form_description(
-    form: &mut crate::views::feature_form::FeatureForm,
-    area: Rect,
-    frame: &mut Frame<'_>,
-    focused: bool,
-) {
-    if focused && form.description_editing() {
-        if let Some(editor) = form.editor.as_mut() {
+        let rect = rects
+            .fields
+            .iter()
+            .find(|(f, _)| *f == target_focus)
+            .map(|(_, r)| *r);
+        if let (Some(rect), Some(editor)) = (rect, form.editor.as_mut()) {
             editor.focused = true;
-            let widget = crate::views::editor::EditorWidget {
+            let widget = EditorWidget {
                 view: editor,
-                area_title: "Description (Esc/Backspace to commit)".into(),
+                area_title: editor_overlay_title(target),
                 git_status: None,
             };
-            frame.render_widget(widget, area);
-            return;
+            frame.render_widget(Clear, rect);
+            frame.render_widget(widget, rect);
         }
     }
-    let block = field_block("Description (i/Enter to edit)", focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if form.description.trim().is_empty() {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                "(empty — i/Enter to edit)",
-                Style::default().fg(Color::DarkGray),
-            )),
-            inner,
-        );
-    } else {
-        let lines: Vec<Line> = form
-            .description
-            .lines()
-            .map(|l| Line::from(l.to_string()))
-            .collect();
-        frame.render_widget(Paragraph::new(lines), inner);
+
+    rects
+}
+
+fn editor_overlay_title(target: crate::views::feature_form::EditorTarget) -> String {
+    use crate::views::feature_form::EditorTarget;
+    match target {
+        EditorTarget::Description => "Description (Esc/Backspace to commit)".into(),
+        EditorTarget::Comment(_) => "Message (Esc/Backspace to commit)".into(),
+        EditorTarget::NewComment => "New message (Esc/Backspace to commit)".into(),
     }
 }
 
-fn render_form_steps(
+struct FeatureLayout {
+    lines: Vec<Line<'static>>,
+    regions: Vec<(crate::views::feature_form::FormFocus, u16, u16)>,
+    statuses: Vec<(crate::project::FeatureStatus, u16, u16, u16)>,
+}
+
+fn build_feature_layout(
     form: &crate::views::feature_form::FeatureForm,
-    area: Rect,
-    frame: &mut Frame<'_>,
     focused: bool,
-) -> Vec<(crate::views::feature_form::FormFocus, Rect)> {
-    use crate::project::StepStatus;
+    inner_width: u16,
+) -> FeatureLayout {
+    use crate::project::{CommentStatus, FeatureStatus, StepStatus};
     use crate::views::feature_form::FormFocus;
-    let block = field_block("Steps (Ctrl+T cycle • Ctrl+D delete)", focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
-    let active_step = match form.focus {
-        FormFocus::Step(i) => Some(i),
-        _ => None,
+    let wrap_width = (inner_width as usize).min(120).max(10);
+    let indent_lvl1: usize = 2;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut regions: Vec<(FormFocus, u16, u16)> = Vec::new();
+    let mut statuses: Vec<(FeatureStatus, u16, u16, u16)> = Vec::new();
+
+    let title_focused = focused && matches!(form.focus, FormFocus::Title);
+    let status_focused = focused && matches!(form.focus, FormFocus::Status);
+    let prefix = if title_focused {
+        "▶ "
+    } else if status_focused {
+        "  "
+    } else {
+        "  "
     };
-    let on_new = matches!(form.focus, FormFocus::NewStep);
-    let mut rects: Vec<(FormFocus, Rect)> = Vec::new();
+    let title_text = if form.title.is_empty() {
+        "(untitled — Enter to edit)".to_string()
+    } else {
+        form.title.clone()
+    };
+    let title_style = if form.title.is_empty() {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    };
+    let title_line_y = lines.len() as u16;
+    let mut title_spans: Vec<Span<'static>> = Vec::new();
+    title_spans.push(Span::raw(prefix.to_string()));
+    let mut x_off = prefix.chars().count() as u16;
+    if title_focused {
+        push_cursor_spans(&mut title_spans, &title_text, form.cursor, title_style);
+        x_off = x_off.saturating_add(title_text.chars().count() as u16);
+    } else {
+        title_spans.push(Span::styled(title_text.clone(), title_style));
+        x_off = x_off.saturating_add(title_text.chars().count() as u16);
+    }
+    title_spans.push(Span::raw(" ".to_string()));
+    x_off = x_off.saturating_add(1);
+    let status_label = format!("[{}]", form.status.label());
+    let status_color = feature_status_color(form.status);
+    let status_w = status_label.chars().count() as u16;
+    let status_style = if status_focused {
+        Style::default()
+            .bg(status_color)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(status_color).add_modifier(Modifier::BOLD)
+    };
+    title_spans.push(Span::styled(status_label, status_style));
+    lines.push(Line::from(title_spans));
+    regions.push((FormFocus::Title, title_line_y, 1));
+    regions.push((FormFocus::Status, title_line_y, 1));
+    statuses.push((form.status, title_line_y, x_off, status_w));
 
-    let mut row: u16 = 0;
+    lines.push(Line::from(""));
+
+    let desc_focused = focused && matches!(form.focus, FormFocus::Description);
+    let desc_y = lines.len() as u16;
+    let prefix = if desc_focused { "▶ " } else { "  " };
+    let cont_prefix = "  ";
+    if form.description.trim().is_empty() {
+        let placeholder = if desc_focused {
+            "(empty — Enter to edit)".to_string()
+        } else {
+            "(no description — Enter to edit)".to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(prefix.to_string()),
+            Span::styled(placeholder, Style::default().fg(Color::DarkGray)),
+        ]));
+        regions.push((FormFocus::Description, desc_y, 1));
+    } else {
+        let wrapped = wrap_paragraph(&form.description, wrap_width.saturating_sub(indent_lvl1));
+        let count = wrapped.len() as u16;
+        for (i, w) in wrapped.into_iter().enumerate() {
+            let p = if i == 0 { prefix } else { cont_prefix };
+            lines.push(Line::from(vec![Span::raw(p.to_string()), Span::raw(w)]));
+        }
+        regions.push((FormFocus::Description, desc_y, count.max(1)));
+    }
+
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        "  Steps".to_string(),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )));
+
     for (i, step) in form.steps.iter().enumerate() {
         if step.deleted {
             continue;
         }
-        if row >= inner.height {
-            break;
-        }
-        let is_active = Some(i) == active_step;
-        let prefix = if is_active { "▶ " } else { "  " };
+        let step_focused = focused && matches!(form.focus, FormFocus::Step(idx) if idx == i);
+        let prefix = if step_focused { "  ▶ " } else { "    " };
         let glyph_style = match step.status {
             StepStatus::Done => Style::default().fg(Color::Green),
             StepStatus::InProgress => Style::default().fg(Color::Yellow),
             StepStatus::Todo => Style::default(),
         };
-        let line_area = Rect {
-            x: inner.x,
-            y: inner.y + row,
-            width: inner.width,
-            height: 1,
-        };
         let head = format!("{}{} ", prefix, step.status.glyph());
-        let head_w = head.chars().count() as u16;
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(head, glyph_style)])),
-            line_area,
-        );
-        let text_area = Rect {
-            x: inner.x.saturating_add(head_w),
-            y: inner.y + row,
-            width: inner.width.saturating_sub(head_w),
-            height: 1,
-        };
-        if is_active {
-            render_inline_input(frame, text_area, &step.summary, form.cursor, "(step text)");
-        } else {
-            frame.render_widget(
-                Paragraph::new(Line::from(step.summary.clone())),
-                text_area,
-            );
+        let head_indent = head.chars().count() as u16 as usize;
+        let avail = wrap_width.saturating_sub(head_indent).max(8);
+        let wrapped = wrap_paragraph(&step.summary, avail);
+        let lines_for_step = wrapped.len().max(1);
+        let step_y = lines.len() as u16;
+        for (j, w) in wrapped.into_iter().enumerate() {
+            if j == 0 {
+                let mut spans: Vec<Span<'static>> = vec![Span::styled(head.clone(), glyph_style)];
+                if step_focused && step.summary.chars().count() <= avail {
+                    push_cursor_spans(&mut spans, &w, form.cursor, Style::default());
+                } else {
+                    spans.push(Span::raw(w));
+                }
+                lines.push(Line::from(spans));
+            } else {
+                let pad: String = std::iter::repeat(' ').take(head_indent).collect();
+                lines.push(Line::from(vec![Span::raw(pad), Span::raw(w)]));
+            }
         }
-        rects.push((FormFocus::Step(i), line_area));
-        row += 1;
+        regions.push((FormFocus::Step(i), step_y, lines_for_step as u16));
     }
-    if row < inner.height {
-        let line_area = Rect {
-            x: inner.x,
-            y: inner.y + row,
-            width: inner.width,
-            height: 1,
-        };
-        let prefix = if on_new { "▶ + " } else { "  + " };
-        let head_w = prefix.chars().count() as u16;
-        let prefix_style = if on_new {
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Green)
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(prefix, prefix_style)])),
-            line_area,
-        );
-        let text_area = Rect {
-            x: inner.x.saturating_add(head_w),
-            y: inner.y + row,
-            width: inner.width.saturating_sub(head_w),
-            height: 1,
-        };
-        if on_new {
-            render_inline_input(
-                frame,
-                text_area,
-                &form.new_step_buf,
-                form.cursor,
-                "new step…",
-            );
-        } else {
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    "new step",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                text_area,
-            );
-        }
-        rects.push((FormFocus::NewStep, line_area));
-    }
-    rects
-}
 
-fn render_form_comments(
-    form: &mut crate::views::feature_form::FeatureForm,
-    area: Rect,
-    frame: &mut Frame<'_>,
-    focused: bool,
-) -> Vec<(crate::views::feature_form::FormFocus, Rect)> {
-    use crate::project::CommentStatus;
-    use crate::views::feature_form::{EditorTarget, FormFocus};
-    if focused && form.message_editing() {
-        let target = form.editor_target();
-        if let (Some(editor), Some(target)) = (form.editor.as_mut(), target) {
-            editor.focused = true;
-            let title = match target {
-                EditorTarget::NewComment => "New message (Esc/Backspace to commit)".to_string(),
-                _ => "Message (Esc/Backspace to commit)".to_string(),
-            };
-            let widget = crate::views::editor::EditorWidget {
-                view: editor,
-                area_title: title,
-                git_status: None,
-            };
-            frame.render_widget(widget, area);
-            let rect = match target {
-                EditorTarget::Comment(i) => (FormFocus::Comment(i), area),
-                _ => (FormFocus::NewComment, area),
-            };
-            return vec![rect];
-        }
-    }
-    let block = field_block("Messages (i/Enter to edit • Ctrl+T status • Ctrl+K kind • Ctrl+D delete)", focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let active_comment = match form.focus {
-        FormFocus::Comment(i) => Some(i),
-        _ => None,
+    let ns_focused = focused && matches!(form.focus, FormFocus::NewStep);
+    let ns_prefix = if ns_focused { "  ▶ + " } else { "    + " };
+    let ns_y = lines.len() as u16;
+    let head_style = if ns_focused {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
     };
-    let on_new = matches!(form.focus, FormFocus::NewComment);
-    let mut rects: Vec<(FormFocus, Rect)> = Vec::new();
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(ns_prefix.to_string(), head_style)];
+    if ns_focused {
+        let buf = if form.new_step_buf.is_empty() {
+            String::new()
+        } else {
+            form.new_step_buf.clone()
+        };
+        push_cursor_spans(&mut spans, &buf, form.cursor, Style::default());
+        if buf.is_empty() && form.cursor == 0 {
+            // cursor rendered already via push_cursor_spans
+        }
+    } else {
+        spans.push(Span::styled(
+            "new step".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines.push(Line::from(spans));
+    regions.push((FormFocus::NewStep, ns_y, 1));
 
-    let mut row: u16 = 0;
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        "  Messages".to_string(),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )));
+
     for (i, comment) in form.comments.iter().enumerate() {
         if comment.deleted {
             continue;
         }
-        if row >= inner.height {
-            break;
-        }
-        let is_active = Some(i) == active_comment;
-        let prefix = if is_active { "▶ " } else { "  " };
+        let msg_focused = focused && matches!(form.focus, FormFocus::Comment(idx) if idx == i);
+        let prefix = if msg_focused { "  ▶ " } else { "    " };
         let badge_style = match comment.status {
             CommentStatus::Queued => Style::default().fg(Color::Yellow),
             CommentStatus::Sent => Style::default().fg(Color::Cyan),
@@ -1202,86 +1356,142 @@ fn render_form_comments(
             comment_kind_glyph(comment.kind),
             comment.status.label()
         );
-        let head_w = head.chars().count() as u16;
-        let line_area = Rect {
-            x: inner.x,
-            y: inner.y + row,
-            width: inner.width,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(head, badge_style)])),
-            line_area,
-        );
-        let text_area = Rect {
-            x: inner.x.saturating_add(head_w),
-            y: inner.y + row,
-            width: inner.width.saturating_sub(head_w),
-            height: 1,
-        };
-        let first_line = comment.message.lines().next().unwrap_or("");
-        if is_active {
-            render_inline_input(frame, text_area, first_line, form.cursor, "(comment)");
+        let head_indent = head.chars().count();
+        let avail = wrap_width.saturating_sub(head_indent).max(8);
+        let wrapped = wrap_paragraph(&comment.message, avail);
+        let mut height: u16 = 0;
+        let msg_y = lines.len() as u16;
+        if wrapped.is_empty() {
+            lines.push(Line::from(vec![Span::styled(head.clone(), badge_style)]));
+            height = 1;
         } else {
-            let suffix = if comment.message.lines().count() > 1 {
-                "  …"
+            for (j, w) in wrapped.into_iter().enumerate() {
+                if j == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(head.clone(), badge_style),
+                        Span::raw(w),
+                    ]));
+                } else {
+                    let pad: String = std::iter::repeat(' ').take(head_indent).collect();
+                    lines.push(Line::from(vec![Span::raw(pad), Span::raw(w)]));
+                }
+                height += 1;
+            }
+        }
+        regions.push((FormFocus::Comment(i), msg_y, height.max(1)));
+    }
+
+    let nc_focused = focused && matches!(form.focus, FormFocus::NewComment);
+    let nc_prefix = if nc_focused { "  ▶ + " } else { "    + " };
+    let nc_y = lines.len() as u16;
+    let head_style = if nc_focused {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    let spans: Vec<Span<'static>> = if nc_focused {
+        let hint = if form.new_comment_buf.trim().is_empty() {
+            "(Enter to open editor)".to_string()
+        } else {
+            form.new_comment_buf.clone()
+        };
+        vec![
+            Span::styled(nc_prefix.to_string(), head_style),
+            Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        vec![
+            Span::styled(nc_prefix.to_string(), head_style),
+            Span::styled(
+                "new message".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]
+    };
+    lines.push(Line::from(spans));
+    regions.push((FormFocus::NewComment, nc_y, 1));
+
+    FeatureLayout {
+        lines,
+        regions,
+        statuses,
+    }
+}
+
+fn push_cursor_spans(
+    spans: &mut Vec<Span<'static>>,
+    text: &str,
+    cursor: usize,
+    base: Style,
+) {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let before: String = chars[..cursor].iter().collect();
+    let at: String = if cursor < chars.len() {
+        chars[cursor].to_string()
+    } else {
+        " ".to_string()
+    };
+    let after: String = if cursor + 1 < chars.len() {
+        chars[cursor + 1..].iter().collect()
+    } else {
+        String::new()
+    };
+    if !before.is_empty() {
+        spans.push(Span::styled(before, base));
+    }
+    spans.push(Span::styled(at, base.add_modifier(Modifier::REVERSED)));
+    if !after.is_empty() {
+        spans.push(Span::styled(after, base));
+    }
+}
+
+fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if width == 0 {
+        out.push(text.to_string());
+        return out;
+    }
+    let paragraphs: Vec<&str> = text.split('\n').collect();
+    for paragraph in paragraphs {
+        if paragraph.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        for word in paragraph.split_whitespace() {
+            let word_len = word.chars().count();
+            if cur.is_empty() {
+                if word_len > width {
+                    let chars: Vec<char> = word.chars().collect();
+                    for chunk in chars.chunks(width) {
+                        out.push(chunk.iter().collect());
+                    }
+                } else {
+                    cur.push_str(word);
+                }
+            } else if cur.chars().count() + 1 + word_len <= width {
+                cur.push(' ');
+                cur.push_str(word);
             } else {
-                ""
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(format!("{}{}", first_line, suffix))),
-                text_area,
-            );
+                out.push(std::mem::take(&mut cur));
+                if word_len > width {
+                    let chars: Vec<char> = word.chars().collect();
+                    for chunk in chars.chunks(width) {
+                        out.push(chunk.iter().collect());
+                    }
+                } else {
+                    cur.push_str(word);
+                }
+            }
         }
-        rects.push((FormFocus::Comment(i), line_area));
-        row += 1;
-    }
-    if row < inner.height {
-        let line_area = Rect {
-            x: inner.x,
-            y: inner.y + row,
-            width: inner.width,
-            height: 1,
-        };
-        let prefix = if on_new { "▶ + " } else { "  + " };
-        let head_w = prefix.chars().count() as u16;
-        let prefix_style = if on_new {
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Green)
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(prefix, prefix_style)])),
-            line_area,
-        );
-        let text_area = Rect {
-            x: inner.x.saturating_add(head_w),
-            y: inner.y + row,
-            width: inner.width.saturating_sub(head_w),
-            height: 1,
-        };
-        if on_new {
-            render_inline_input(
-                frame,
-                text_area,
-                &form.new_comment_buf,
-                form.cursor,
-                "new comment…",
-            );
-        } else {
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    "new comment",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                text_area,
-            );
+        if !cur.is_empty() {
+            out.push(cur);
         }
-        rects.push((FormFocus::NewComment, line_area));
     }
-    rects
+    out
 }
 
 fn render_inline_input(
@@ -1323,25 +1533,16 @@ fn render_inline_input(
     }
 }
 
-fn field_block(title: &str, focused: bool) -> Block<'_> {
-    let style = if focused {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(style)
-        .title(format!(" {} ", title))
-}
-
 fn split_off_agent_lane(app: &mut App, frame: &mut Frame<'_>, area: Rect) -> Rect {
     if !app.agent_lane_visible || area.width < 36 {
         app.agent_lane_area = Rect::default();
         app.agent_lane_tile_rects.clear();
         return area;
     }
-    let lane_width: u16 = 36u16.min(area.width / 3).max(28);
+    let max_lane = area.width.saturating_sub(24).max(20);
+    let min_lane: u16 = 20;
+    let lane_width = app.agent_lane_width.clamp(min_lane, max_lane);
+    app.agent_lane_width = lane_width;
     let split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(24), Constraint::Length(lane_width)])
@@ -1514,6 +1715,31 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
     out
 }
 
+fn render_runtime_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(project) = app.open_projects.get(app.active_index).cloned() else {
+        return;
+    };
+    let needs_load = app
+        .project_views
+        .get(&project.id)
+        .map(|s| s.runtime.is_none())
+        .unwrap_or(false);
+    if needs_load {
+        app.ensure_runtime_loaded();
+    }
+    let Some(state) = app.project_views.get_mut(&project.id) else {
+        return;
+    };
+    let Some(runtime) = state.runtime.as_ref() else {
+        return;
+    };
+    let rects =
+        crate::views::runtime::render_runtime(runtime, frame, area, &project.name);
+    app.left_pane_area = rects.list;
+    app.right_pane_area = rects.log;
+    app.runtime_list_area = rects.list;
+}
+
 fn render_terminal_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let Some(project) = app.open_projects.get(app.active_index).cloned() else {
         return;
@@ -1532,9 +1758,15 @@ fn render_terminal_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     };
     let total = state.terminals.len();
     let active = state.active_terminal.unwrap_or(0);
+    let focused = matches!(app.focus_context, FocusContext::SubTabs);
 
     let mut spans: Vec<Span> = Vec::new();
-    let mut x = chunks[0].x + 1;
+    let marker = if focused { "▶ " } else { "  " };
+    spans.push(Span::styled(
+        marker,
+        Style::default().fg(if focused { Color::Yellow } else { Color::DarkGray }),
+    ));
+    let mut x = chunks[0].x + marker.chars().count() as u16;
     for i in 0..total {
         let text = format!(" {} ", i + 1);
         let w = text.chars().count() as u16;
@@ -1543,6 +1775,8 @@ fn render_terminal_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
                 .bg(Color::Yellow)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
+        } else if focused {
+            Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -1609,9 +1843,15 @@ fn render_agents_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     };
     let total = state.agents.len();
     let active = state.active_agent.unwrap_or(0);
+    let focused = matches!(app.focus_context, FocusContext::SubTabs);
 
     let mut spans: Vec<Span> = Vec::new();
-    let mut x = chunks[0].x + 1;
+    let marker = if focused { "▶ " } else { "  " };
+    spans.push(Span::styled(
+        marker,
+        Style::default().fg(if focused { Color::Yellow } else { Color::DarkGray }),
+    ));
+    let mut x = chunks[0].x + marker.chars().count() as u16;
     for (i, agent) in state.agents.iter().enumerate() {
         let text = format!(" {} ", agent.name);
         let w = text.chars().count() as u16;
@@ -1620,6 +1860,8 @@ fn render_agents_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
                 .bg(Color::Yellow)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD)
+        } else if focused {
+            Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -1671,7 +1913,21 @@ fn render_agents_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
 fn render_tabs(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     app.tabs_area = area;
     app.tab_rects.clear();
-    let block = Block::default().borders(Borders::ALL).title(" CoffeeTable ");
+    let focused = matches!(app.focus_context, FocusContext::ProjectTabs);
+    let border_style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    let title = if focused {
+        " CoffeeTable ◀ "
+    } else {
+        " CoffeeTable "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1694,9 +1950,16 @@ fn render_tabs(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
             break;
         }
         let style = if i == app.active_index {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            if focused {
+                Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            }
         } else {
             Style::default()
         };
@@ -1726,7 +1989,7 @@ fn render_body(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Min(20)])
+        .constraints([Constraint::Percentage(app.split_pct), Constraint::Min(20)])
         .split(area);
     app.left_pane_area = chunks[0];
     app.right_pane_area = chunks[1];
@@ -1860,10 +2123,10 @@ fn push_dir_entries(
         .flatten()
         .filter_map(|d| {
             let name = d.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') && name != ".github" {
+            let ft = d.file_type().ok()?;
+            if ft.is_dir() && name == ".git" {
                 return None;
             }
-            let ft = d.file_type().ok()?;
             Some((ft.is_dir(), name, d.path()))
         })
         .collect();
@@ -1982,18 +2245,24 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
                     .to_string()
             }
             Some(crate::app::ViewMode::Git) => {
-                "j/k move • Tab pane • Enter open • c checkout • p push • P pull • m merge • R PR • V PRs • r refresh • ? help".to_string()
+                "j/k move • Tab pane • Enter open • c checkout • p push • P pull • m merge • R PR • V PRs • W worktrees • n new • D del • r refresh • ? help".to_string()
+            }
+            Some(crate::app::ViewMode::Github) => {
+                "j/k move • Tab pane • Enter open • r refresh • R rerun • F rerun-failed • X cancel • c checkout PR • ? help".to_string()
             }
             Some(crate::app::ViewMode::Terminal) => {
                 "Ctrl+Space leader • Ctrl+L/H switch • Ctrl+Shift+C SIGINT • Ctrl+J/K view • ? help".to_string()
             }
+            Some(crate::app::ViewMode::Runtime) => {
+                "j/k move • Enter/f filter • r run • R run all • s stop • b build • x restart • e reload config • c clear log • ? help".to_string()
+            }
             _ => match current_focus(app) {
                 Some(Focus::Editor) => {
-                    ":palette  •  i insert  •  v visual  •  /search  •  Backspace tree  •  Space menu  •  ? help"
+                    "Ctrl+P palette  •  i insert  •  v visual  •  /search  •  Backspace tree  •  Space menu  •  ? help"
                         .to_string()
                 }
                 _ => {
-                    ":palette  •  Space menu  •  ? help  •  Tab switch  •  Space q quit".to_string()
+                    "Ctrl+P palette  •  Space menu  •  ? help  •  Tab switch  •  Space q quit".to_string()
                 }
             },
         },
@@ -2001,6 +2270,10 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         AppMode::Grep => "Type to filter  •  Enter open  •  Esc cancel".into(),
         AppMode::OpenConfirm => "y / Enter open  •  n / Esc cancel".into(),
         AppMode::ConfirmDeleteFeature => "y / Enter delete  •  n / Esc cancel".into(),
+        AppMode::AgentRename => "Type to edit  •  Enter save  •  Esc cancel".into(),
+        AppMode::WorktreePrompt => "Branch name for new worktree  •  Enter create  •  Esc cancel".into(),
+        AppMode::FilePrompt => "Type a name  •  Enter confirm  •  Esc cancel".into(),
+        AppMode::ConfirmDeleteFile => "y / Enter delete  •  n / Esc cancel".into(),
         AppMode::Palette => "↑/↓ select  •  Enter run  •  ! suffix forces  •  Esc cancel".into(),
         AppMode::ExplorerFilter => "Type to narrow  •  ↑/↓ select  •  Enter open  •  Esc clear+exit".into(),
         AppMode::AiCommit => {
@@ -2011,11 +2284,204 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 _ => "i edit  •  Ctrl+S commit  •  Ctrl+R regen  •  Esc cancel".into(),
             }
         }
+        AppMode::Settings => {
+            "Tab pane  •  Ctrl+S save  •  Ctrl+I import  •  Ctrl+E export  •  Esc close".into()
+        }
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
         area,
     );
+}
+
+fn render_status_toolbar(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let project = app.open_projects.get(app.active_index);
+    let cwd_span = match project {
+        Some(p) => Span::styled(
+            format!(" {} ", p.path.display()),
+            Style::default().fg(Color::Cyan),
+        ),
+        None => Span::styled(
+            " (no project) ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+
+    let git_spans = build_git_status_spans(app);
+    let token_spans = build_token_spans(app);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(cwd_span);
+    if !git_spans.is_empty() {
+        spans.push(Span::styled(
+            "│".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.extend(git_spans);
+    }
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let token_used: usize = token_spans.iter().map(|s| s.content.chars().count()).sum();
+    let total_w = area.width as usize;
+    if total_w > used + token_used + 1 {
+        let pad = total_w - used - token_used;
+        spans.push(Span::raw(" ".repeat(pad)));
+    } else {
+        spans.push(Span::raw(" "));
+    }
+    spans.extend(token_spans);
+
+    let line = Line::from(spans);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(Color::Rgb(20, 20, 28))),
+        area,
+    );
+}
+
+fn build_git_status_spans(app: &App) -> Vec<Span<'static>> {
+    let Some(project) = app.open_projects.get(app.active_index) else {
+        return Vec::new();
+    };
+    let Some(state) = app.project_views.get(&project.id) else {
+        return Vec::new();
+    };
+    let branch = state
+        .branch
+        .clone()
+        .unwrap_or_else(|| "(no branch)".into());
+    let statuses = state.tree.git_status();
+    let mut modified = 0usize;
+    let mut staged = 0usize;
+    let mut untracked = 0usize;
+    let mut deleted = 0usize;
+    for (_, st) in statuses.iter() {
+        match st {
+            crate::git::GitStatus::Modified => modified += 1,
+            crate::git::GitStatus::Staged => staged += 1,
+            crate::git::GitStatus::Untracked => untracked += 1,
+            crate::git::GitStatus::Deleted => deleted += 1,
+        }
+    }
+    let mut spans = vec![Span::styled(
+        format!(" {} ", branch),
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if modified == 0 && staged == 0 && untracked == 0 && deleted == 0 {
+        spans.push(Span::styled(
+            "clean ".to_string(),
+            Style::default().fg(Color::Green),
+        ));
+    } else {
+        if staged > 0 {
+            spans.push(Span::styled(
+                format!("●{} ", staged),
+                Style::default().fg(Color::Green),
+            ));
+        }
+        if modified > 0 {
+            spans.push(Span::styled(
+                format!("✚{} ", modified),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if deleted > 0 {
+            spans.push(Span::styled(
+                format!("✖{} ", deleted),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        if untracked > 0 {
+            spans.push(Span::styled(
+                format!("?{} ", untracked),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+    }
+    spans
+}
+
+fn build_token_spans(app: &App) -> Vec<Span<'static>> {
+    use crate::token_usage::{format_compact, format_duration};
+    let snapshot = app
+        .token_usage
+        .lock()
+        .map(|s| *s)
+        .unwrap_or_default();
+
+    let limits = app
+        .open_projects
+        .get(app.active_index)
+        .map(|p| {
+            let s = app.effective_settings_for(p.id);
+            (s.ai.session_token_limit, s.ai.weekly_token_limit)
+        })
+        .unwrap_or((None, None));
+
+    if snapshot.last_scan_at.is_none() {
+        return vec![Span::styled(
+            " tokens: scanning… ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )];
+    }
+    if let Some(err) = snapshot.last_error {
+        return vec![Span::styled(
+            format!(" tokens: {} ", err),
+            Style::default().fg(Color::Red),
+        )];
+    }
+
+    let has_limits = limits.0.is_some() || limits.1.is_some();
+    if has_limits {
+        let session_span = token_window_span("5h", snapshot.session_tokens, limits.0);
+        let weekly_span = token_window_span("7d", snapshot.weekly_tokens, limits.1);
+        return vec![
+            Span::styled(" tokens ".to_string(), Style::default().fg(Color::DarkGray)),
+            session_span,
+            Span::styled(" · ".to_string(), Style::default().fg(Color::DarkGray)),
+            weekly_span,
+            Span::raw(" "),
+        ];
+    }
+
+    vec![
+        Span::styled(" tokens ".to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("5h {}", format_compact(snapshot.session_tokens)),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(" · thinking ".to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("5h {}", format_duration(snapshot.session_thinking_secs)),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::raw(" "),
+    ]
+}
+
+fn token_window_span(label: &str, used: u64, limit: Option<u64>) -> Span<'static> {
+    use crate::token_usage::format_compact;
+    match limit {
+        Some(cap) if cap > 0 => {
+            let left = cap.saturating_sub(used);
+            let pct = (used as f64 / cap as f64).clamp(0.0, 1.0);
+            let color = if pct >= 0.9 {
+                Color::Red
+            } else if pct >= 0.7 {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+            Span::styled(
+                format!("{} {} left ({:.0}%)", label, format_compact(left), pct * 100.0),
+                Style::default().fg(color),
+            )
+        }
+        _ => Span::styled(
+            format!("{} {} used", label, format_compact(used)),
+            Style::default().fg(Color::Cyan),
+        ),
+    }
 }
 
 fn current_focus(app: &App) -> Option<Focus> {
@@ -2208,6 +2674,70 @@ fn render_ai_commit_overlay(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
+fn render_settings_overlay(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(overlay) = app.settings_overlay.as_mut() else { return };
+    let popup = centered_rect(80, 80, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Settings ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[0]);
+
+    overlay.global.focused = matches!(overlay.focus, SettingsPane::Global);
+    overlay.project.focused = matches!(overlay.focus, SettingsPane::Project);
+
+    let global_title = format!("global · {}", overlay.global.path.display());
+    let project_title = match overlay.project_id {
+        Some(_) => "project · DB-backed".to_string(),
+        None => "project · (no active project)".to_string(),
+    };
+
+    let left_widget = crate::views::editor::EditorWidget {
+        view: &mut overlay.global,
+        area_title: global_title,
+        git_status: None,
+    };
+    frame.render_widget(left_widget, panes[0]);
+
+    let right_widget = crate::views::editor::EditorWidget {
+        view: &mut overlay.project,
+        area_title: project_title,
+        git_status: None,
+    };
+    frame.render_widget(right_widget, panes[1]);
+
+    let status_line = if overlay.status.is_empty() {
+        Line::from(Span::styled(
+            "  Tab switch pane  •  Ctrl+S save  •  Ctrl+I import file  •  Ctrl+E export file  •  Esc close",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!("  {}", overlay.status),
+            Style::default().fg(Color::Yellow),
+        ))
+    };
+    frame.render_widget(Paragraph::new(status_line), chunks[1]);
+
+    let hint = Line::from(Span::styled(
+        "  Left pane writes to settings.yaml on disk. Right pane writes to DB; use import/export for the on-disk CoffeeTable.Settings.yaml.",
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(hint), chunks[2]);
+}
+
 fn render_delete_feature_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let Some((_, title)) = app.pending_delete_feature.as_ref() else { return };
     let popup = centered_rect_fixed(70, 9, area);
@@ -2319,6 +2849,215 @@ fn render_grep_overlay(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     if let Some(view) = app.grep.as_mut() {
         frame.render_widget(GrepWidget { view }, popup);
     }
+}
+
+fn render_agent_rename_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(st) = app.agent_rename.as_ref() else { return };
+    let popup = centered_rect_fixed(60, 7, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Rename agent ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let input_inner = input_block.inner(chunks[0]);
+    frame.render_widget(input_block, chunks[0]);
+    render_inline_input(frame, input_inner, &st.buffer, st.cursor, "(new name)");
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(" save  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(" cancel"),
+        ]))
+        .style(Style::default().fg(Color::DarkGray)),
+        chunks[1],
+    );
+}
+
+fn render_worktree_prompt_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(st) = app.worktree_prompt.as_ref() else { return };
+    let popup = centered_rect_fixed(70, 9, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" New worktree ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let path_preview = app
+        .open_projects
+        .get(app.active_index)
+        .map(|p| {
+            let preview = crate::app::preview_worktree_path(&p.path, &st.buffer);
+            format!("  Path: {}", preview.display())
+        })
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            path_preview,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[0],
+    );
+
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" branch ");
+    let input_inner = input_block.inner(chunks[1]);
+    frame.render_widget(input_block, chunks[1]);
+    render_inline_input(frame, input_inner, &st.buffer, st.cursor, "(new branch name)");
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Enter", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" create branch + worktree  "),
+            Span::styled("Esc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" cancel"),
+        ]))
+        .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn render_file_prompt_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    use crate::app::FilePromptKind;
+    let Some(st) = app.file_prompt.as_ref() else { return };
+    let (title, label, hint) = match st.kind {
+        FilePromptKind::NewFile => (" New file ", " name ", "(filename to create)"),
+        FilePromptKind::NewDir => (" New directory ", " name ", "(directory name)"),
+        FilePromptKind::Rename => (" Rename ", " name ", "(new name)"),
+    };
+    let popup = centered_rect_fixed(74, 9, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let preview = st.parent.join(if st.buffer.trim().is_empty() {
+        "<name>".to_string()
+    } else {
+        st.buffer.clone()
+    });
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  Path: {}", preview.display()),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[0],
+    );
+
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(label);
+    let input_inner = input_block.inner(chunks[1]);
+    frame.render_widget(input_block, chunks[1]);
+    render_inline_input(frame, input_inner, &st.buffer, st.cursor, hint);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Enter", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" confirm  "),
+            Span::styled("Esc", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" cancel"),
+        ]))
+        .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn render_delete_file_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(path) = app.pending_delete_file.as_ref() else { return };
+    let popup = centered_rect_fixed(74, 9, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Delete file? ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let kind_note = if path.is_dir() {
+        "  This will recursively delete the directory and its contents."
+    } else {
+        "  This will permanently delete the file."
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Delete "),
+            Span::styled(
+                path.display().to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("?"),
+        ]),
+        Line::from(Span::styled(
+            kind_note,
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "y / Enter",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  delete     "),
+            Span::styled(
+                "n / Esc",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  cancel"),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_help_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -2441,6 +3180,17 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                 ("y (error state)", "copy error text to clipboard"),
             ],
         ),
+        AppMode::Settings => (
+            "Settings",
+            vec![
+                ("Tab / BackTab", "switch between global (left) and project (right) panes"),
+                ("Ctrl+S", "save focused pane (left → disk, right → DB)"),
+                ("Ctrl+I", "import CoffeeTable.Settings.yaml from project root into DB"),
+                ("Ctrl+E", "export project settings from DB to CoffeeTable.Settings.yaml"),
+                ("i / a / o", "vim-style edit in focused pane"),
+                ("Esc", "close (press again to discard unsaved changes)"),
+            ],
+        ),
         AppMode::Palette => (
             "Command palette",
             vec![
@@ -2449,6 +3199,43 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                 ("Enter", "run highlighted command (or literal if none)"),
                 ("! suffix", "force (q!, e!, Q!)"),
                 ("Esc", "cancel"),
+            ],
+        ),
+        AppMode::AgentRename => (
+            "Rename agent",
+            vec![
+                ("(text)", "type the new agent name"),
+                ("← / →  Home / End", "move cursor"),
+                ("Backspace / Delete", "edit text"),
+                ("Enter", "save"),
+                ("Esc", "cancel"),
+            ],
+        ),
+        AppMode::WorktreePrompt => (
+            "New worktree",
+            vec![
+                ("(text)", "branch name (will be created if missing)"),
+                ("← / →  Home / End", "move cursor"),
+                ("Backspace / Delete", "edit text"),
+                ("Enter", "create branch + worktree alongside repo"),
+                ("Esc", "cancel"),
+            ],
+        ),
+        AppMode::FilePrompt => (
+            "File prompt",
+            vec![
+                ("(text)", "file or directory name"),
+                ("← / →  Home / End", "move cursor"),
+                ("Backspace / Delete", "edit text"),
+                ("Enter", "create / rename"),
+                ("Esc", "cancel"),
+            ],
+        ),
+        AppMode::ConfirmDeleteFile => (
+            "Delete file?",
+            vec![
+                ("y / Enter", "delete"),
+                ("n / Esc", "cancel"),
             ],
         ),
         AppMode::Normal => {
@@ -2470,6 +3257,30 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                 .and_then(|p| app.project_views.get(&p.id))
                 .map(|s| matches!(s.view_mode, crate::app::ViewMode::Git))
                 .unwrap_or(false);
+            let in_github = app
+                .open_projects
+                .get(app.active_index)
+                .and_then(|p| app.project_views.get(&p.id))
+                .map(|s| matches!(s.view_mode, crate::app::ViewMode::Github))
+                .unwrap_or(false);
+            if in_github {
+                return (
+                    "GitHub",
+                    vec![
+                        ("j/k  ↓/↑", "navigate within focused pane"),
+                        ("Tab / Shift+Tab", "cycle panes (runs → PRs → details)"),
+                        ("Enter / l", "load full run log / PR view into details"),
+                        ("Esc / Backspace", "back to list pane (clears details)"),
+                        ("g / G", "jump to top / bottom of focused pane"),
+                        ("r", "refresh runs + PRs"),
+                        ("R", "re-run selected workflow run (all jobs)"),
+                        ("F", "re-run only failed jobs of selected run"),
+                        ("X", "cancel selected workflow run"),
+                        ("c", "checkout selected PR (gh pr checkout)"),
+                        ("Ctrl+J / Ctrl+K", "switch view"),
+                    ],
+                );
+            }
             if in_git {
                 return (
                     "Git",
@@ -2485,6 +3296,10 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                         ("m", "merge selected branch into current"),
                         ("R", "create a PR for the current branch (gh)"),
                         ("V", "list PRs for selected branch (gh)"),
+                        ("W", "list worktrees in the details pane"),
+                        ("n", "create a new worktree (prompts for branch)"),
+                        ("D", "delete the selected worktree"),
+                        ("Enter (worktree)", "open the worktree as a project tab"),
                         ("r", "refresh branches + commits"),
                         ("Ctrl+J / Ctrl+K", "switch view"),
                     ],
@@ -2512,6 +3327,31 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                         ("Ctrl+S", "save form to db"),
                         ("Esc / Backspace (nav)", "save & close form"),
                         ("Ctrl+J / Ctrl+K", "switch view (Editor/Terminal/Project)"),
+                    ],
+                );
+            }
+            let in_runtime = app
+                .open_projects
+                .get(app.active_index)
+                .and_then(|p| app.project_views.get(&p.id))
+                .map(|s| matches!(s.view_mode, crate::app::ViewMode::Runtime))
+                .unwrap_or(false);
+            if in_runtime {
+                return (
+                    "Runtime",
+                    vec![
+                        ("j/k  ↓/↑", "navigate services"),
+                        ("g / G", "jump to first / last service"),
+                        ("Enter / f", "toggle output filter to selected service"),
+                        ("Esc", "clear output filter"),
+                        ("c", "clear output buffer"),
+                        ("e", "reload CoffeeTable.Runtime.yaml"),
+                        ("r / R", "run selected / run all"),
+                        ("s / S", "stop selected / stop all"),
+                        ("b / B", "build selected / build all"),
+                        ("x / X", "restart selected / restart all"),
+                        (":run [name]", "palette command (also :stop, :build, :restart)"),
+                        ("Ctrl+J / Ctrl+K", "switch view"),
                     ],
                 );
             }
@@ -2544,7 +3384,7 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                         ("e", "open selected file and focus editor"),
                         ("g / G", "jump to top / bottom"),
                         ("Tab / Shift+Tab", "next / previous project"),
-                        (":", "open command palette (works globally)"),
+                        ("Ctrl+P", "open command palette (works globally)"),
                         ("Space c", "toggle Changes view ↔ Tree view"),
                         ("Space p / f / g", "projects / find file / grep"),
                         ("Space e / b / w", "focus tree / editor / toggle"),
@@ -2570,7 +3410,7 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                         ("y (visual) / d", "yank / delete selection"),
                         ("u / Ctrl+R", "undo / redo"),
                         ("/pattern  n / N", "search forward, next / prev"),
-                        (":", "open command palette (dropdown)"),
+                        ("Ctrl+P", "open command palette (dropdown)"),
                         (":S  /  :settings", "open settings.yaml (autoreloads on save)"),
                         ("Space h  /  :H", "show HEAD version of file (read-only)"),
                         ("Space d  /  :D", "show unified diff against HEAD (read-only)"),
