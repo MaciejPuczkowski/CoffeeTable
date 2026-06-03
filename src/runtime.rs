@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read};
@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const RUNTIME_CONFIG_FILE: &str = "CoffeeTable.Runtime.yaml";
 const MAX_LOG_LINES: usize = 4000;
 const RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -106,7 +105,6 @@ impl ServiceProcess {
 
 pub struct Runtime {
     pub project_root: PathBuf,
-    pub config_path: PathBuf,
     pub config: RuntimeConfig,
     pub services: Vec<ServiceProcess>,
     pub log: Arc<Mutex<VecDeque<LogLine>>>,
@@ -114,17 +112,14 @@ pub struct Runtime {
     pub filter: Option<String>,
     pub last_load_error: Option<String>,
     pub last_loaded_at: Option<Instant>,
-    pub yaml: String,
     sys: sysinfo::System,
     last_sample_at: Option<Instant>,
 }
 
 impl Runtime {
-    pub fn new(project_root: PathBuf, initial_yaml: String) -> Self {
-        let config_path = project_root.join(RUNTIME_CONFIG_FILE);
+    pub fn new(project_root: PathBuf, initial_config: RuntimeConfig) -> Self {
         let mut rt = Self {
             project_root,
-            config_path,
             config: RuntimeConfig::default(),
             services: Vec::new(),
             log: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES))),
@@ -132,18 +127,16 @@ impl Runtime {
             filter: None,
             last_load_error: None,
             last_loaded_at: None,
-            yaml: String::new(),
             sys: sysinfo::System::new(),
             last_sample_at: None,
         };
-        rt.apply_yaml(initial_yaml);
+        rt.apply_config_external(initial_config);
         rt
     }
 
-    pub fn apply_yaml(&mut self, yaml: String) {
-        self.yaml = yaml;
-        match parse_runtime_yaml(&self.yaml) {
-            Ok(config) => {
+    pub fn apply_config_external(&mut self, config: RuntimeConfig) {
+        match validate_config(&config) {
+            Ok(()) => {
                 self.last_load_error = None;
                 self.last_loaded_at = Some(Instant::now());
                 self.apply_config(config);
@@ -183,11 +176,7 @@ impl Runtime {
     }
 
     pub fn config_exists(&self) -> bool {
-        !self.yaml.trim().is_empty()
-    }
-
-    pub fn config_file_exists(&self) -> bool {
-        self.config_path.is_file()
+        !self.config.services.is_empty()
     }
 
     pub fn move_selection(&mut self, delta: i32) {
@@ -638,11 +627,7 @@ fn spawn_reader<R: Read + Send + 'static>(
     });
 }
 
-pub fn parse_runtime_yaml(raw: &str) -> Result<RuntimeConfig> {
-    if raw.trim().is_empty() {
-        return Ok(RuntimeConfig::default());
-    }
-    let config: RuntimeConfig = serde_yaml::from_str(raw).context("parse runtime YAML")?;
+pub fn validate_config(config: &RuntimeConfig) -> Result<()> {
     let mut seen: HashSet<String> = HashSet::new();
     for svc in &config.services {
         if svc.name.trim().is_empty() {
@@ -652,7 +637,7 @@ pub fn parse_runtime_yaml(raw: &str) -> Result<RuntimeConfig> {
             anyhow::bail!("Duplicate service name `{}`", svc.name);
         }
     }
-    Ok(config)
+    Ok(())
 }
 
 fn parse_command(raw: &str) -> Option<Vec<String>> {

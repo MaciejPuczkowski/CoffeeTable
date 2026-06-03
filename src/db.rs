@@ -279,27 +279,6 @@ impl Db {
         Ok(())
     }
 
-    pub fn load_project_runtime_yaml(&self, project_id: i64) -> Result<Option<String>> {
-        let raw: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT yaml FROM project_runtime WHERE project_id = ?1",
-                params![project_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(raw)
-    }
-
-    pub fn save_project_runtime_yaml(&self, project_id: i64, yaml: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO project_runtime (project_id, yaml) VALUES (?1, ?2)
-             ON CONFLICT(project_id) DO UPDATE SET yaml = excluded.yaml",
-            params![project_id, yaml],
-        )?;
-        Ok(())
-    }
-
     pub fn load_project_meta(&self, project_id: i64) -> Result<ProjectMeta> {
         let row: Option<(String, String, String, String)> = self
             .conn

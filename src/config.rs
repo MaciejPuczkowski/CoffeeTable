@@ -55,6 +55,8 @@ pub struct Settings {
     pub ai: AiConfig,
     #[serde(default)]
     pub shell: ShellConfig,
+    #[serde(default)]
+    pub runtime: crate::runtime::RuntimeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +149,7 @@ impl Settings {
             search_excludes: default_search_excludes(),
             ai: AiConfig::default(),
             shell: ShellConfig::default(),
+            runtime: crate::runtime::RuntimeConfig::default(),
         }
     }
 
@@ -159,6 +162,10 @@ impl Settings {
                 .unwrap_or_else(|| self.search_excludes.clone()),
             ai: overrides.ai.clone().unwrap_or_else(|| self.ai.clone()),
             shell: overrides.shell.clone().unwrap_or_else(|| self.shell.clone()),
+            runtime: overrides
+                .runtime
+                .clone()
+                .unwrap_or_else(|| self.runtime.clone()),
         }
     }
 }
@@ -175,6 +182,8 @@ pub struct ProjectSettings {
     pub shell: Option<ShellConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub views: Option<ViewsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<crate::runtime::RuntimeConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -213,7 +222,17 @@ impl ProjectSettings {
          #   args: []\n\
          #\n\
          # views:\n\
-         #   project: false   # hide the Project (Kanban) tab for this project\n"
+         #   project: false   # hide the Project (Kanban) tab for this project\n\
+         #\n\
+         # runtime:\n\
+         #   services:\n\
+         #     - name: api\n\
+         #       command: cargo run -p api\n\
+         #       cwd: services/api\n\
+         #       build: cargo build -p api\n\
+         #       depends_on: []\n\
+         #       env:\n\
+         #         RUST_LOG: debug\n"
             .into()
     }
 }

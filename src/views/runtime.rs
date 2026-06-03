@@ -181,46 +181,38 @@ fn empty_state_lines(runtime: &Runtime) -> Vec<Line<'static>> {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Press `e` to reload after fixing.",
+            "  Fix the YAML in `:S` settings then save (Ctrl+S), or press `e` here to re-apply.",
             Style::default().fg(Color::DarkGray),
         )));
         return lines;
     }
     if !runtime.config_exists() {
         lines.push(Line::from(Span::styled(
-            "  Runtime config not set for this project.",
+            "  No services configured for this project.",
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(""));
-        if runtime.config_file_exists() {
+        lines.push(Line::from(Span::styled(
+            "  Open settings with `:S`, add a `runtime:` block in the project (right) pane, then save (Ctrl+S).",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Example:",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        for sample in EXAMPLE_YAML.lines() {
             lines.push(Line::from(Span::styled(
-                format!(
-                    "  {} found on disk — run `:import-runtime` to load it into the DB.",
-                    crate::runtime::RUNTIME_CONFIG_FILE
-                ),
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                "  Create a YAML config (for example):",
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(""));
-            for sample in EXAMPLE_YAML.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", sample),
-                    Style::default().fg(Color::Cyan),
-                )));
-            }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  …save as {} at the project root, then run `:import-runtime`.",
-                    crate::runtime::RUNTIME_CONFIG_FILE
-                ),
-                Style::default().fg(Color::DarkGray),
+                format!("  {}", sample),
+                Style::default().fg(Color::Cyan),
             )));
         }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  After saving settings, press `e` here to re-apply (auto-applied on settings save).",
+            Style::default().fg(Color::DarkGray),
+        )));
         return lines;
     }
     lines.push(Line::from(Span::styled(
@@ -289,12 +281,13 @@ pub fn service_index_at_row(area: Rect, row: u16, service_count: usize) -> Optio
 }
 
 const EXAMPLE_YAML: &str = "\
-services:
-  - name: api
-    command: dotnet run --project src/Api
-    build: dotnet build src/Api
-  - name: web
-    command: npm run dev
-    cwd: web
-    depends_on: [api]
+runtime:
+  services:
+    - name: api
+      command: dotnet run --project src/Api
+      build: dotnet build src/Api
+    - name: web
+      command: npm run dev
+      cwd: web
+      depends_on: [api]
 ";
