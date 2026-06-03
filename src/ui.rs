@@ -60,6 +60,7 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
         AppMode::Palette => render_command_palette_overlay(app, frame, area),
         AppMode::AiCommit => render_ai_commit_overlay(app, frame, area),
         AppMode::Settings => render_settings_overlay(app, frame, area),
+        AppMode::LogView => render_log_overlay(app, frame, area),
         AppMode::AgentRename => render_agent_rename_overlay(app, frame, area),
         AppMode::WorktreePrompt => render_worktree_prompt_overlay(app, frame, area),
         AppMode::FilePrompt => render_file_prompt_overlay(app, frame, area),
@@ -2287,6 +2288,9 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         AppMode::Settings => {
             "Tab pane  •  Ctrl+S save  •  Ctrl+I import  •  Ctrl+E export  •  Esc close".into()
         }
+        AppMode::LogView => {
+            "j/k scroll  •  g/G top/bottom  •  c clear  •  y copy  •  Esc/q close".into()
+        }
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -2736,6 +2740,67 @@ fn render_settings_overlay(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         Style::default().fg(Color::DarkGray),
     ));
     frame.render_widget(Paragraph::new(hint), chunks[2]);
+}
+
+fn render_log_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let popup = centered_rect(80, 70, area);
+    frame.render_widget(Clear, popup);
+    let title = format!(" Log ({} entries) ", app.log.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+
+    let body_h = chunks[0].height as usize;
+    let total = app.log.len();
+    let entries: Vec<&crate::log::LogEntry> = app.log.iter().collect();
+
+    let lines: Vec<Line> = if entries.is_empty() {
+        vec![Line::from(Span::styled(
+            "  (no log entries yet)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        let scroll = app.log_scroll.min(total.saturating_sub(1));
+        let start = scroll;
+        let end = total.min(start + body_h);
+        entries[start..end]
+            .iter()
+            .map(|e| {
+                let (label, label_color) = match e.kind {
+                    crate::log::LogKind::Info => ("INFO ", Color::Cyan),
+                    crate::log::LogKind::Warn => ("WARN ", Color::Yellow),
+                    crate::log::LogKind::Error => ("ERROR", Color::Red),
+                };
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {:<10}", crate::log::relative_age(e.timestamp)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("{} ", label),
+                        Style::default().fg(label_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(e.text.clone()),
+                ])
+            })
+            .collect()
+    };
+
+    frame.render_widget(Paragraph::new(lines), chunks[0]);
+
+    let footer = Line::from(Span::styled(
+        "  j/k scroll · g/G top/bottom · c clear · y copy · Esc/q close",
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(footer), chunks[1]);
 }
 
 fn render_delete_feature_overlay(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -3189,6 +3254,16 @@ fn help_context(app: &App) -> (&'static str, Vec<(&'static str, &'static str)>) 
                 ("Ctrl+E", "export project settings from DB to CoffeeTable.Settings.yaml"),
                 ("i / a / o", "vim-style edit in focused pane"),
                 ("Esc", "close (press again to discard unsaved changes)"),
+            ],
+        ),
+        AppMode::LogView => (
+            "Log",
+            vec![
+                ("j / k", "scroll one line"),
+                ("g / G", "jump to top / bottom"),
+                ("c", "clear log"),
+                ("y", "copy all log entries to clipboard"),
+                ("Esc / q", "close"),
             ],
         ),
         AppMode::Palette => (

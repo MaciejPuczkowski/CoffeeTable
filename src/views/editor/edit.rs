@@ -21,6 +21,35 @@ impl EditorView {
         }
     }
 
+    pub fn paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.snapshot();
+        let row = self.cursor.0;
+        if self.cursor.1 > self.lines[row].len() {
+            self.cursor.1 = self.lines[row].len();
+        }
+        let col = self.cursor.1;
+        let tail: Vec<char> = self.lines[row].drain(col..).collect();
+        let mut segments = normalized.split('\n');
+        let first = segments.next().unwrap_or("");
+        self.lines[row].extend(first.chars());
+        let mut cur_row = row;
+        let mut last_len_chars = first.chars().count();
+        for seg in segments {
+            cur_row += 1;
+            let seg_chars: Vec<char> = seg.chars().collect();
+            last_len_chars = seg_chars.len();
+            self.lines.insert(cur_row, seg_chars);
+        }
+        self.lines[cur_row].extend(tail);
+        self.cursor = (cur_row, last_len_chars);
+        self.preferred_col = self.cursor.1;
+        self.modified = true;
+    }
+
     pub(super) fn backspace(&mut self) {
         self.snapshot();
         if self.cursor.1 > 0 {
