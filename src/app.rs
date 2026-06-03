@@ -35,6 +35,7 @@ pub enum AppMode {
     FilePrompt,
     ConfirmDeleteFile,
     Settings,
+    LogView,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -208,8 +209,8 @@ pub struct App {
     pub search_excludes: Vec<String>,
     pub ai_config: crate::config::AiConfig,
     pub shell_config: crate::config::ShellConfig,
+    pub runtime_config: crate::runtime::RuntimeConfig,
     pub project_settings_yaml: HashMap<i64, String>,
-    pub runtime_yaml: HashMap<i64, String>,
     pub open_projects: Vec<Project>,
     pub active_index: usize,
     pub project_views: HashMap<i64, ProjectViewState>,
@@ -258,6 +259,9 @@ pub struct App {
     pub tab_chord: Option<Instant>,
     pub last_disk_poll: Option<Instant>,
     pub token_usage: Arc<Mutex<crate::token_usage::TokenSnapshot>>,
+    pub log: crate::log::LogBuffer,
+    pub last_logged_status: String,
+    pub log_scroll: usize,
 }
 
 impl App {
@@ -268,6 +272,7 @@ impl App {
         let search_excludes = settings.search_excludes;
         let ai_config = settings.ai;
         let shell_config = settings.shell;
+        let runtime_config = settings.runtime;
         let (open_ids, active_id) = db.load_open_projects()?;
         let all = db.list_projects()?;
         let open_projects: Vec<Project> = open_ids
@@ -334,8 +339,8 @@ impl App {
             search_excludes,
             ai_config,
             shell_config,
+            runtime_config,
             project_settings_yaml,
-            runtime_yaml: HashMap::new(),
             open_projects,
             active_index,
             project_views,
@@ -388,6 +393,9 @@ impl App {
                 crate::token_usage::start_background_scanner(state.clone());
                 state
             },
+            log: crate::log::LogBuffer::default(),
+            last_logged_status: String::new(),
+            log_scroll: 0,
         })
     }
 
@@ -480,6 +488,7 @@ impl App {
             AppMode::FilePrompt => self.on_key_file_prompt(key)?,
             AppMode::ConfirmDeleteFile => self.on_key_confirm_delete_file(key)?,
             AppMode::Settings => self.on_key_settings(key)?,
+            AppMode::LogView => self.on_key_log_view(key)?,
             AppMode::Normal => self.on_key_normal(key)?,
         }
         Ok(())
@@ -614,8 +623,7 @@ impl App {
             }
             "import-settings" | "psi" => self.palette_import_project_settings(),
             "export-settings" | "pse" => self.palette_export_project_settings(),
-            "import-runtime" | "rti" => self.palette_import_runtime(),
-            "export-runtime" | "rte" => self.palette_export_runtime(),
+            "log" | "logs" => self.open_log_view(),
             "" => {}
             other => self.status = format!("Not a command: {}", other),
         }
@@ -893,6 +901,7 @@ impl App {
             KeyCode::Char('r') => self.open_runtime_view()?,
             KeyCode::Char('a') => self.agent_for_selected_feature()?,
             KeyCode::Char('L') => self.toggle_agent_lane(),
+            KeyCode::Char('l') => self.open_log_view(),
             KeyCode::Char('z') => self.cycle_editor_wrap(),
             KeyCode::Char('?') => self.help_visible = true,
             KeyCode::Char('q') => self.should_quit = true,
@@ -928,6 +937,7 @@ impl App {
             search_excludes: self.search_excludes.clone(),
             ai: self.ai_config.clone(),
             shell: self.shell_config.clone(),
+            runtime: self.runtime_config.clone(),
         };
         s.save(&self.settings_path)
     }
@@ -1638,7 +1648,8 @@ impl App {
             | AppMode::WorktreePrompt
             | AppMode::FilePrompt
             | AppMode::ConfirmDeleteFile
-            | AppMode::Settings => false,
+            | AppMode::Settings
+            | AppMode::LogView => false,
             AppMode::Normal => {
                 if let Some(state) = self.active_state_ref() {
                     if matches!(state.view_mode, ViewMode::Terminal | ViewMode::Agents) {
@@ -1794,44 +1805,35 @@ impl App {
         if already {
             return;
         }
-        let yaml = self.load_or_bootstrap_runtime_yaml(&project);
-        let runtime = crate::runtime::Runtime::new(project.path.clone(), yaml);
+        let config = self.effective_settings_for(project.id).runtime;
+        let runtime = crate::runtime::Runtime::new(project.path.clone(), config);
         if let Some(state) = self.active_state() {
             state.runtime = Some(runtime);
         }
     }
 
-    fn load_or_bootstrap_runtime_yaml(&mut self, project: &Project) -> String {
-        if let Some(cached) = self.runtime_yaml.get(&project.id) {
-            return cached.clone();
-        }
-        let db_yaml = self
-            .db
-            .load_project_runtime_yaml(project.id)
-            .unwrap_or(None);
-        if let Some(yaml) = db_yaml {
-            self.runtime_yaml.insert(project.id, yaml.clone());
-            return yaml;
-        }
-        let file_path = project.path.join(crate::runtime::RUNTIME_CONFIG_FILE);
-        if let Ok(raw) = std::fs::read_to_string(&file_path) {
-            if !raw.trim().is_empty() {
-                if self
-                    .db
-                    .save_project_runtime_yaml(project.id, &raw)
-                    .is_ok()
-                {
-                    self.status = format!(
-                        "Bootstrapped runtime config from {} → DB",
-                        crate::runtime::RUNTIME_CONFIG_FILE
-                    );
-                }
-                self.runtime_yaml.insert(project.id, raw.clone());
-                return raw;
+    fn runtime_reapply_from_settings(&mut self) {
+        let Some(project_id) = self.active_project().map(|p| p.id) else {
+            self.status = "No active project".into();
+            return;
+        };
+        let config = self.effective_settings_for(project_id).runtime;
+        if let Some(state) = self.active_state() {
+            if let Some(rt) = state.runtime.as_mut() {
+                rt.apply_config_external(config);
             }
         }
-        self.runtime_yaml.insert(project.id, String::new());
-        String::new()
+        self.status = self.runtime_load_status();
+    }
+
+    fn runtime_reapply_from_settings_silent(&mut self) {
+        let Some(project_id) = self.active_project().map(|p| p.id) else { return };
+        let config = self.effective_settings_for(project_id).runtime;
+        if let Some(state) = self.active_state() {
+            if let Some(rt) = state.runtime.as_mut() {
+                rt.apply_config_external(config);
+            }
+        }
     }
 
     pub fn open_runtime_view(&mut self) -> Result<()> {
@@ -1865,8 +1867,7 @@ impl App {
                 self.with_runtime(|r| r.clear_log());
             }
             (KeyCode::Char('e'), _) => {
-                self.reapply_runtime_yaml_from_cache();
-                self.status = self.runtime_load_status();
+                self.runtime_reapply_from_settings();
             }
             (KeyCode::Char('r'), _) => self.runtime_action(RuntimeAction::Run, true),
             (KeyCode::Char('R'), _) => self.runtime_action(RuntimeAction::Run, false),
@@ -2386,6 +2387,20 @@ impl App {
         self.poll_disk_changes();
         self.poll_runtimes();
         self.sanitize_view_mode();
+        self.mirror_status_to_log();
+    }
+
+    fn mirror_status_to_log(&mut self) {
+        if self.status.is_empty() || self.status == self.last_logged_status {
+            return;
+        }
+        let kind = crate::log::classify(&self.status);
+        self.log.push(kind, self.status.clone());
+        self.last_logged_status = self.status.clone();
+    }
+
+    pub fn log_error(&mut self, text: impl Into<String>) {
+        self.log.push(crate::log::LogKind::Error, text);
     }
 
     fn sanitize_view_mode(&mut self) {
@@ -2987,6 +3002,7 @@ impl App {
                 }
                 overlay.status = "Global settings saved".into();
                 self.reload_settings_from_disk();
+                self.runtime_reapply_from_settings_silent();
             }
             SettingsPane::Project => {
                 let Some(project_id) = overlay.project_id else {
@@ -3015,6 +3031,7 @@ impl App {
                     o.project.modified = false;
                     o.status = "Project settings saved to DB".into();
                 }
+                self.runtime_reapply_from_settings_silent();
             }
         }
         Ok(())
@@ -3115,66 +3132,52 @@ impl App {
         self.status = format!("Exported DB → {}", path.display());
     }
 
-    fn palette_import_runtime(&mut self) {
-        let Some(project) = self.active_project().cloned() else {
-            self.status = "No active project".into();
-            return;
-        };
-        let path = project.path.join(crate::runtime::RUNTIME_CONFIG_FILE);
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                self.status = format!("Read {}: {}", path.display(), e);
-                return;
-            }
-        };
-        if let Err(e) = crate::runtime::parse_runtime_yaml(&raw) {
-            self.status = format!("Invalid YAML in {}: {}", path.display(), e);
-            return;
-        }
-        if let Err(e) = self.db.save_project_runtime_yaml(project.id, &raw) {
-            self.status = format!("DB error: {}", e);
-            return;
-        }
-        self.runtime_yaml.insert(project.id, raw.clone());
-        self.reapply_runtime_yaml_from_cache();
-        self.status = format!("Imported {} → DB", path.display());
+    pub fn open_log_view(&mut self) {
+        self.log_scroll = 0;
+        self.mode = AppMode::LogView;
     }
 
-    fn palette_export_runtime(&mut self) {
-        let Some(project) = self.active_project().cloned() else {
-            self.status = "No active project".into();
-            return;
-        };
-        let body = self
-            .runtime_yaml
-            .get(&project.id)
-            .cloned()
-            .unwrap_or_default();
-        if body.trim().is_empty() {
-            self.status = "Runtime config empty — nothing to export".into();
-            return;
-        }
-        let path = project.path.join(crate::runtime::RUNTIME_CONFIG_FILE);
-        if let Err(e) = std::fs::write(&path, &body) {
-            self.status = format!("Write {}: {}", path.display(), e);
-            return;
-        }
-        self.status = format!("Exported DB → {}", path.display());
+    fn close_log_view(&mut self) {
+        self.mode = AppMode::Normal;
     }
 
-    fn reapply_runtime_yaml_from_cache(&mut self) {
-        let Some(project_id) = self.active_project().map(|p| p.id) else { return };
-        let yaml = self
-            .runtime_yaml
-            .get(&project_id)
-            .cloned()
-            .unwrap_or_default();
-        if let Some(state) = self.active_state() {
-            if let Some(rt) = state.runtime.as_mut() {
-                rt.apply_yaml(yaml);
+    fn on_key_log_view(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => self.close_log_view(),
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
+                self.log_scroll = self.log_scroll.saturating_add(1);
             }
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+                self.log_scroll = self.log_scroll.saturating_sub(1);
+            }
+            (KeyCode::Char('g'), _) => self.log_scroll = 0,
+            (KeyCode::Char('G'), _) => {
+                self.log_scroll = self.log.len();
+            }
+            (KeyCode::Char('c'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                self.log.clear();
+                self.log_scroll = 0;
+                self.status = "Log cleared".into();
+            }
+            (KeyCode::Char('y'), _) => {
+                let text: String = self
+                    .log
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "[{}] {}",
+                            kind_label(e.kind),
+                            e.text
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                crate::clipboard::copy(&text);
+                self.status = "Log copied to clipboard".into();
+            }
+            _ => {}
         }
+        Ok(())
     }
 
     fn export_project_settings_to_file(&mut self) {
@@ -3209,6 +3212,7 @@ impl App {
                 self.search_excludes = s.search_excludes;
                 self.ai_config = s.ai;
                 self.shell_config = s.shell;
+                self.runtime_config = s.runtime;
                 self.status = "Settings reloaded".into();
             }
             Err(e) => {
@@ -3223,6 +3227,7 @@ impl App {
             search_excludes: self.search_excludes.clone(),
             ai: self.ai_config.clone(),
             shell: self.shell_config.clone(),
+            runtime: self.runtime_config.clone(),
         }
     }
 
@@ -4885,17 +4890,96 @@ This keeps the Project tab as the source of truth for the conversation history."
         if text.is_empty() {
             return;
         }
-        let Some(view) = self.current_view_mode() else { return };
-        match view {
-            ViewMode::Agents => {
-                let bytes = bracketed_paste_bytes(&text);
-                self.write_to_active_agent(&bytes);
+        if matches!(self.mode, AppMode::Settings) {
+            if let Some(overlay) = self.settings_overlay.as_mut() {
+                let editor = match overlay.focus {
+                    SettingsPane::Global => &mut overlay.global,
+                    SettingsPane::Project => &mut overlay.project,
+                };
+                editor.paste_text(&text);
                 self.status = format!("Pasted {} chars", text.chars().count());
             }
-            ViewMode::Terminal => {
-                let bytes = bracketed_paste_bytes(&text);
-                self.write_to_active_terminal(&bytes);
-                self.status = format!("Pasted {} chars", text.chars().count());
+            return;
+        }
+        if matches!(self.mode, AppMode::Normal) {
+            if let Some(view) = self.current_view_mode() {
+                match view {
+                    ViewMode::Agents => {
+                        let bytes = bracketed_paste_bytes(&text);
+                        self.write_to_active_agent(&bytes);
+                        self.status = format!("Pasted {} chars", text.chars().count());
+                        return;
+                    }
+                    ViewMode::Terminal => {
+                        let bytes = bracketed_paste_bytes(&text);
+                        self.write_to_active_terminal(&bytes);
+                        self.status = format!("Pasted {} chars", text.chars().count());
+                        return;
+                    }
+                    ViewMode::Editor => {
+                        if let Some(state) = self.active_state() {
+                            if let Some(editor) = state.editor.as_mut() {
+                                editor.paste_text(&text);
+                                self.status = format!("Pasted {} chars", text.chars().count());
+                            }
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(first_line) = paste_first_line(&text) {
+            self.paste_into_text_prompt(&first_line);
+        }
+    }
+
+    fn paste_into_text_prompt(&mut self, text: &str) {
+        match self.mode {
+            AppMode::Palette => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.push_str(text);
+                }
+            }
+            AppMode::Grep => {
+                if let Some(p) = self.grep.as_mut() {
+                    p.pattern.push_str(text);
+                }
+            }
+            AppMode::ExplorerFilter => {
+                if let Some(state) = self.active_state() {
+                    let mut q = state.tree.filter.clone();
+                    q.push_str(text);
+                    state.tree.set_filter(q);
+                }
+            }
+            AppMode::FilePrompt => {
+                if let Some(p) = self.file_prompt.as_mut() {
+                    insert_into_prompt(&mut p.buffer, &mut p.cursor, text);
+                }
+            }
+            AppMode::AgentRename => {
+                if let Some(p) = self.agent_rename.as_mut() {
+                    insert_into_prompt(&mut p.buffer, &mut p.cursor, text);
+                }
+            }
+            AppMode::WorktreePrompt => {
+                if let Some(p) = self.worktree_prompt.as_mut() {
+                    insert_into_prompt(&mut p.buffer, &mut p.cursor, text);
+                }
+            }
+            AppMode::AiCommit => {
+                if let Some(overlay) = self.ai_commit.as_mut() {
+                    match &mut overlay.state {
+                        AiCommitState::Reviewing { editor } => editor.paste_text(text),
+                        AiCommitState::ReviewingPlan { messages, current, .. } => {
+                            if let Some(editor) = messages.get_mut(*current) {
+                                editor.paste_text(text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }
@@ -6000,6 +6084,23 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn paste_first_line(text: &str) -> Option<String> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let first = normalized.split('\n').next().unwrap_or("").to_string();
+    if first.is_empty() { None } else { Some(first) }
+}
+
+fn insert_into_prompt(buffer: &mut String, cursor: &mut usize, text: &str) {
+    let chars: Vec<char> = buffer.chars().collect();
+    let idx = (*cursor).min(chars.len());
+    let mut out: String = chars[..idx].iter().collect();
+    out.push_str(text);
+    out.extend(chars[idx..].iter());
+    let added = text.chars().count();
+    *buffer = out;
+    *cursor = idx + added;
+}
+
 fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut out = Vec::with_capacity(normalized.len() + 12);
@@ -6084,6 +6185,14 @@ fn contains(rect: Rect, col: u16, row: u16) -> bool {
         && col < rect.x + rect.width
         && row >= rect.y
         && row < rect.y + rect.height
+}
+
+pub fn kind_label(kind: crate::log::LogKind) -> &'static str {
+    match kind {
+        crate::log::LogKind::Info => "INFO",
+        crate::log::LogKind::Warn => "WARN",
+        crate::log::LogKind::Error => "ERROR",
+    }
 }
 
 fn discover_new(roots: &[PathBuf], saved: &[Project]) -> Vec<(String, PathBuf)> {
